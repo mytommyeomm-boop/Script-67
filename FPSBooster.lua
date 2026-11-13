@@ -1,5 +1,6 @@
 --[[
-	ROBLOX ULTIMATE FPS BOOSTER V2 — SMART GAME AUTO OPTIMIZATION   (LocalScript)
+	ROBLOX ULTIMATE FPS BOOSTER V2 — SMART GAME AUTO OPTIMIZATION + MAP INTELLIGENCE
+	(LocalScript)
 
 	INSTALL (Roblox Studio)
 	  1. Explorer > StarterPlayer > StarterPlayerScripts
@@ -29,6 +30,9 @@ local StarterGui        = game:GetService("StarterGui")
 local Stats             = game:GetService("Stats")
 local Lighting          = game:GetService("Lighting")
 local CollectionService = game:GetService("CollectionService")
+local Teams             = game:GetService("Teams")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -39,10 +43,15 @@ local CONFIG = {
 	IGNORE_TAG           = "FPSBoosterIgnore",
 	IFRAME_TAG           = "FPSBoosterIFrameOverlay",
 	KEEP_ATTRIBUTE       = "FPSBoosterKeep",
-	-- Exact names a developer explicitly approves as disposable IFrame visuals.
-	-- Empty by default: nothing is ever matched by a "Frame"/"IFrame" substring.
 	IFRAME_OVERLAY_NAMES = {},
-	REPEAT_MIN           = 12,   -- identical-name emitters before they count as "repeated"
+	REPEAT_MIN           = 12,
+	MAP_SCAN_INTERVAL    = 30,   -- monitor ticks (0.5s each) => ~15s
+	SCAN_CAPS = {
+		RemoteStorage = 200,
+		RoundPattern  = 800,
+		ShopGui       = 400,
+		ShopBackpack  = 100,
+	},
 }
 
 --// Singleton guard (no duplicate GUIs / optimizers) -----------------------------------------
@@ -126,7 +135,7 @@ end
 
 local function scaleFloor(orig, mult, floorValue)
 	local v = orig * mult
-	local f = math.min(orig, floorValue) -- never push above the original
+	local f = math.min(orig, floorValue)
 	if v < f then v = f end
 	return v
 end
@@ -145,7 +154,6 @@ end
 --==================================================================================================
 -- 1) DATA: levels, profiles, modes
 --==================================================================================================
--- Every multiplier keeps effects visible. Nothing is deleted, disabled or zeroed.
 local LEVELS = {
 	{ name = "Low",    rate = 0.75, life = 0.95, size = 1.00, trail = 0.85, beam = 0.85, post = 0.85, cc = 0.97, lightShadows = false },
 	{ name = "Medium", rate = 0.55, life = 0.90, size = 0.95, trail = 0.70, beam = 0.70, post = 0.70, cc = 0.93, lightShadows = false },
@@ -153,10 +161,6 @@ local LEVELS = {
 	{ name = "Ultra",  rate = 0.20, life = 0.65, size = 0.80, trail = 0.40, beam = 0.40, post = 0.40, cc = 0.80, lightShadows = true  },
 }
 
--- Profile "strength" per effect category scales how much of the level's reduction is applied.
--- 0 = fully preserved, 1 = normal, >1 = stronger.
--- Categories: own (local player's character), other (other characters/NPCs),
---             object (small moving objects: balls, projectiles), ambient (world), post (Lighting effects)
 local PROFILES = {
 	Combat    = { tag = "A", display = "Combat / Fighting", bias = 0, repeatS = 1.3, trailS = 1.0,
 		s = { ambient = 1.2, other = 1.1, own = 0.5, object = 0.8, post = 1.0 } },
@@ -182,7 +186,6 @@ local POST_CLASSES = {
 	BloomEffect = true, BlurEffect = true, SunRaysEffect = true,
 	DepthOfFieldEffect = true, ColorCorrectionEffect = true,
 }
--- Detected & counted, but NEVER modified (gameplay indicators / protection).
 local PRESERVED = { Highlight = true, ForceField = true, Sparkles = true, Explosion = true }
 local PART_CLASSES = {
 	Part = true, MeshPart = true, UnionOperation = true, WedgePart = true, CornerWedgePart = true, TrussPart = true,
@@ -192,7 +195,7 @@ local PART_CLASSES = {
 -- 2) STATE
 --==================================================================================================
 local State  = { enabled = true, mode = "Auto", customLevel = 2, profileChoice = "Auto" }
-local Active = { level = 1, profile = "General" }   -- what is currently applied
+local Active = { level = 1, profile = "General" }
 local Detect = { profile = "General", reason = "Analyzing…", workload = "Unknown", pending = nil, pendingCount = 0,
                  lastChange = 0, scores = {} }
 local Auto   = { level = 1, low = 0, high = 0, lowSecs = 0, lastChange = 0, lastDown = nil, floorLevel = 1,
@@ -208,24 +211,43 @@ local Counts = { tracked = 0, adjusted = 0 }
 local IFrame = { enabled = false, conns = {} }
 local StatusText = "Initializing…"
 
+-- NEW: Map Intelligence
+local MapInfo = {
+	placeId        = game.PlaceId,
+	placeName      = "",
+	creatorName    = "",
+	creatorId      = 0,
+	playerCount    = 0,
+	maxPlayers     = 0,
+	isPrivate      = false,
+	hasTeams       = false,
+	teamCount      = 0,
+	hasRoundSys    = false,
+	hasShop        = false,
+	hasLeaderstats = false,
+	remoteCount    = 0,
+	hasTerrain     = false,
+	terrainSize    = 0,
+	partCount      = 0,
+	signature      = "Unknown",
+	confidence     = 0,
+	detectedAt     = 0,
+}
+
 local UI = nil
--- forward declarations
 local refresh, reapplyAll, setEnabled, setMode, cycleProfile, setCustomLevel, setIFrame, restoreAll, closeAll
 
 --==================================================================================================
 -- 3) VFX ENGINE (save → modify → restore)
 --==================================================================================================
--- records[inst][prop] = { orig = saved original, applied = value we wrote }
 local records = setmetatable({}, { __mode = "k" })
-local tracked = setmetatable({}, { __mode = "k" })   -- effect instances we manage
-local metaOf  = setmetatable({}, { __mode = "k" })   -- inst -> { cat = ... }
-local overlays = setmetatable({}, { __mode = "k" })  -- IFrame overlays we manage
+local tracked = setmetatable({}, { __mode = "k" })
+local metaOf  = setmetatable({}, { __mode = "k" })
+local overlays = setmetatable({}, { __mode = "k" })
 local NameCount = {}
 
--- Category context for the instance currently being processed (single-threaded, safe).
 local curCat, curRep = "ambient", false
 
--- Effective multiplier for a property kind, after profile strength is applied.
 local function M(kind, minM)
 	local lvl = LEVELS[Active.level]
 	local prof = PROFILES[Active.profile]
@@ -241,7 +263,7 @@ local lightHandler = { { "Shadows", function(o) if lightShadowsOff() then return
 local HANDLERS = {
 	ParticleEmitter = {
 		{ "Rate", function(o)
-			if o <= 0 then return o end -- burst-only emitters (Emit()) stay untouched
+			if o <= 0 then return o end
 			return math.min(o, math.max(1, round2(o * M("rate", 0.08))))
 		end },
 		{ "Lifetime", function(o)
@@ -272,7 +294,6 @@ local HANDLERS = {
 		{ "FarIntensity",  function(o) return scaleFloor(o, M("post", 0.3), 0.02) end },
 		{ "NearIntensity", function(o) return scaleFloor(o, M("post", 0.3), 0.02) end },
 	},
-	-- Conservative: scales grading offsets toward neutral by a few percent.
 	ColorCorrectionEffect = {
 		{ "Saturation", function(o) return o * M("cc", 0.6) end },
 		{ "Contrast",   function(o) return o * M("cc", 0.6) end },
@@ -282,7 +303,6 @@ local HANDLERS = {
 	PointLight = lightHandler, SpotLight = lightHandler, SurfaceLight = lightHandler,
 }
 
--- Write one property (cfg=true) or restore it (cfg=nil). Skips redundant writes.
 local function applyProp(inst, rec, prop, fn, cfg)
 	local okRead, cur = pcall(function() return inst[prop] end)
 	if not okRead then return end
@@ -293,7 +313,7 @@ local function applyProp(inst, rec, prop, fn, cfg)
 		entry = { orig = cur, applied = cur }
 		rec[prop] = entry
 	elseif not sameValue(cur, entry.applied) then
-		entry.orig, entry.applied = cur, cur -- the game changed it: adopt as the new original
+		entry.orig, entry.applied = cur, cur
 	end
 
 	local target = entry.orig
@@ -309,7 +329,6 @@ local function applyProp(inst, rec, prop, fn, cfg)
 	end
 end
 
--- Category detection (observable structure, never names) ----------------------------------------
 local function findCharacter(inst)
 	local a = inst.Parent
 	while a and a ~= workspace do
@@ -363,7 +382,7 @@ local function processInstance(inst)
 	if enabled then
 		if not metaOf[inst] then register(inst) end
 		local meta = metaOf[inst]
-		if not meta then return end -- ignored via tag/attribute
+		if not meta then return end
 		curCat = meta.cat
 		curRep = inst.ClassName == "ParticleEmitter" and (NameCount[inst.Name] or 0) >= CONFIG.REPEAT_MIN
 		if not rec then rec = {}; records[inst] = rec end
@@ -371,15 +390,12 @@ local function processInstance(inst)
 	for _, h in ipairs(handlers) do
 		applyProp(inst, rec, h[1], h[2], enabled or nil)
 	end
-	if not enabled then records[inst] = nil end -- fully restored
+	if not enabled then records[inst] = nil end
 end
 
 --==================================================================================================
 -- 4) IFRAME MODULE (optional, OFF by default, non-destructive)
 --==================================================================================================
--- Only elements the developer EXPLICITLY marked (tag / attribute / exact approved name) are
--- eligible, and they are only HIDDEN (Visible/Enabled=false), never destroyed. Combat logic,
--- invulnerability frames, hitboxes and damage protection are never touched.
 local approvedNames = {}
 for _, n in ipairs(CONFIG.IFRAME_OVERLAY_NAMES) do approvedNames[n] = true end
 
@@ -397,7 +413,6 @@ local function isApprovedOverlay(inst)
 		or inst:GetAttribute(CONFIG.IFRAME_TAG) == true
 		or approvedNames[inst.Name] == true
 	if not explicit then return false end
-	-- Never hide anything interactive.
 	if inst:IsA("GuiButton") or inst:IsA("TextBox") then return false end
 	if inst:IsA("GuiBase2d") and (inst:FindFirstChildWhichIsA("GuiButton", true) or inst:FindFirstChildWhichIsA("TextBox", true)) then
 		return false
@@ -452,7 +467,7 @@ setIFrame = function(v)
 		end)
 		task.spawn(overlayScan)
 	else
-		for inst in pairs(overlays) do pcall(processOverlay, inst) end -- restores (IFrame.enabled is false)
+		for inst in pairs(overlays) do pcall(processOverlay, inst) end
 		table.clear(overlays)
 	end
 	if UI then UI.syncControls(false) end
@@ -466,7 +481,6 @@ local function processAny(inst)
 	if overlays[inst] then processOverlay(inst) else processInstance(inst) end
 end
 
--- Walks every managed object in small slices so a settings change never hitches a frame.
 local function runPass(gen)
 	local list = {}
 	for inst in pairs(tracked) do list[#list + 1] = inst end
@@ -491,7 +505,7 @@ local function onDescendantAdded(inst)
 end
 
 --==================================================================================================
--- 6) SCENE ANALYSIS + SMART GAME DETECTION
+-- 6) SCENE ANALYSIS
 --==================================================================================================
 local function scanChunk(list, i, j)
 	for k = i, j do
@@ -544,7 +558,6 @@ local function finishScene()
 	end)
 end
 
--- Recomputed periodically from ORIGINAL values, so our own reductions never change the diagnosis.
 local function updateMetrics()
 	local m = { emitters = 0, active = 0, rateSum = 0, trails = 0, beams = 0, post = 0, lights = 0, smokeFire = 0,
 		charFx = 0, objectFx = 0, ambientFx = 0, tracked = 0, maxRep = 0, repRatio = 0, tools = 0 }
@@ -600,100 +613,99 @@ local function updateMetrics()
 	else Detect.workload = "Extreme" end
 end
 
-local function targetFps()
-	local p = Auto.peak
-	if p <= 0 then return 60 end
-	if p < 40 then return 30 end
-	if p < 75 then return 60 end
-	if p < 100 then return 90 end
-	return 120
-end
-
--- Scores each profile from observable characteristics. Returns best profile key + reason text.
-local function evaluateProfile()
-	local m, sc = Metrics, Scene
-	local scores = { Combat = 0, Sports = 0, OpenWorld = 0, Simulator = 0, HeavyVFX = 0 }
-	local why = { Combat = {}, Sports = {}, OpenWorld = {}, Simulator = {}, HeavyVFX = {} }
-	local function add(p, pts, text) scores[p] += pts; why[p][#why[p] + 1] = text end
-
-	local fxTotal = m.emitters + m.trails + m.beams
-	local charRatio = (fxTotal > 0) and (m.charFx / fxTotal) or 0
-
-	-- A: Combat
-	if fxTotal >= 8 and charRatio >= 0.35 then add("Combat", 3, string.format("%d%% of effects attach to characters", math.floor(charRatio * 100))) end
-	if m.tools >= 2 then add("Combat", 2, string.format("%d tools equipped/owned", m.tools)) end
-	if sc.humanoids >= 4 then add("Combat", 1, string.format("%d characters/NPCs present", sc.humanoids)) end
-	-- B: Sports
-	if sc.balls >= 1 and sc.balls <= 4 then add("Sports", 3, string.format("%d ball-shaped moving object(s)", sc.balls)) end
-	if m.objectFx >= 1 and sc.balls >= 1 then add("Sports", 1, "effects attached to moving objects") end
-	if sc.humanoids >= 6 and sc.balls >= 1 then add("Sports", 1, "many players around a ball") end
-	-- C: Open world
-	if sc.extent >= 2500 then add("OpenWorld", 3, string.format("world spans ~%d studs", math.floor(sc.extent))) end
-	if workspace.StreamingEnabled then add("OpenWorld", 2, "StreamingEnabled is on") end
-	if sc.terrainSpan >= 200 then add("OpenWorld", 2, "large terrain area") end
-	if sc.parts >= 20000 then add("OpenWorld", 1, string.format("%d parts loaded", sc.parts)) end
-	-- D: Simulator
-	if m.maxRep >= 15 and m.repRatio >= 0.4 then
-		add("Simulator", 3, string.format("%d identical emitters repeated (%d%% of all)", m.maxRep, math.floor(m.repRatio * 100)))
-	end
-	if player:FindFirstChild("leaderstats") then add("Simulator", 1, "leaderstats present") end
-	if m.ambientFx >= 40 then add("Simulator", 1, string.format("%d world-placed effects", m.ambientFx)) end
-	-- E: Heavy VFX
-	if m.active >= 250 then add("HeavyVFX", 3, string.format("%d active emitters", m.active))
-	elseif m.active >= 120 then add("HeavyVFX", 2, string.format("%d active emitters", m.active)) end
-	if m.rateSum >= 4000 then add("HeavyVFX", 3, string.format("%dk particles/s requested", math.floor(m.rateSum / 1000)))
-	elseif m.rateSum >= 1500 then add("HeavyVFX", 2, string.format("%.1fk particles/s requested", m.rateSum / 1000)) end
-	if m.post >= 4 then add("HeavyVFX", 1, string.format("%d lighting effects", m.post)) end
-	if m.trails + m.beams >= 100 then add("HeavyVFX", 1, string.format("%d trails/beams", m.trails + m.beams)) end
-	if Auto.lowSecs >= 10 and fxTotal >= 60 then add("HeavyVFX", 2, "FPS below target while many effects are active") end
-
-	local best, bestScore = "General", 0
-	for _, p in ipairs({ "Combat", "Sports", "OpenWorld", "Simulator" }) do
-		if scores[p] > bestScore then best, bestScore = p, scores[p] end
-	end
-	if bestScore < 3 then best = "General" end
-	local genre = best
-	if scores.HeavyVFX >= 4 then best = "HeavyVFX" end
-
-	Detect.scores = scores
-	local reason
-	if best == "General" then
-		reason = "No strong genre signature, using balanced defaults"
-	else
-		local parts = {}
-		for i = 1, math.min(3, #why[best]) do parts[i] = why[best][i] end
-		reason = table.concat(parts, "; ")
-		if best == "HeavyVFX" and genre ~= "General" then
-			reason ..= " (also resembles " .. PROFILES[genre].display .. ")"
+--==================================================================================================
+-- 6.5) MAP INTELLIGENCE — structural scan of the experience
+--==================================================================================================
+local function anyDescendantNamed(root, patterns, cap)
+	local n = 0
+	local ok, list = pcall(function() return root:GetDescendants() end)
+	if not ok then return false end
+	for _, d in ipairs(list) do
+		local nm = d.Name:lower()
+		for _, p in ipairs(patterns) do
+			if nm:find(p, 1, true) then return true end
 		end
-	end
-	if sc.preserved > 0 then reason ..= string.format(" · %d protected indicators", sc.preserved) end
-	return best, reason
-end
-
-local function baselineLevel(profileKey)
-	return math.clamp((isMobile and 2 or 1) + PROFILES[profileKey].bias, 1, 4)
-end
-
--- Switching profiles requires repeated evidence + a dwell time (no rapid flipping).
-local function runDetection(initial, now)
-	local best, reason = evaluateProfile()
-	if initial then
-		Detect.profile, Detect.reason, Detect.lastChange, Detect.pending, Detect.pendingCount = best, reason, now, nil, 0
-		Auto.level = baselineLevel(best)
-		return true
-	end
-	if best == Detect.profile then
-		Detect.reason, Detect.pending, Detect.pendingCount = reason, nil, 0
-		return false
-	end
-	if Detect.pending == best then Detect.pendingCount += 1 else Detect.pending, Detect.pendingCount = best, 1 end
-	if Detect.pendingCount >= 3 and now - Detect.lastChange >= 60 then
-		Detect.profile, Detect.reason, Detect.lastChange, Detect.pending, Detect.pendingCount = best, reason, now, nil, 0
-		Auto.level = math.max(Auto.level, baselineLevel(best))
-		return true
+		n += 1
+		if n >= cap then break end
 	end
 	return false
+end
+
+local function scanMapInfo()
+	local info = MapInfo
+	info.detectedAt = os.clock()
+
+	-- Metadata (อาจได้ "" ถ้า HTTP request ปิด)
+	pcall(function()
+		local ok, product = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
+		if ok and product then
+			info.placeName   = product.Name or ""
+			info.creatorName = product.Creator and product.Creator.Name or ""
+			info.creatorId   = product.Creator and product.Creator.CreatorTargetId or 0
+		end
+	end)
+	if info.placeName == "" then
+		pcall(function() info.creatorName = game.CreatorName or ""; info.creatorId = game.CreatorId or 0 end)
+	end
+
+	info.playerCount = #Players:GetPlayers()
+	info.maxPlayers  = Players.MaxPlayers
+	info.isPrivate   = (info.playerCount <= 1 and info.maxPlayers >= 2)
+
+	-- Teams
+	pcall(function()
+		local teams = Teams:GetTeams()
+		info.teamCount = #teams
+		info.hasTeams  = info.teamCount > 0
+	end)
+
+	-- Leaderstats / shop
+	info.hasLeaderstats = player:FindFirstChild("leaderstats") ~= nil
+	info.hasShop = anyDescendantNamed(playerGui, { "shop", "store", "buy" }, CONFIG.SCAN_CAPS.ShopGui)
+		or anyDescendantNamed(player.Backpack, { "shop", "buy" }, CONFIG.SCAN_CAPS.ShopBackpack)
+
+	-- RemoteEvents/Functions (สัญญาณ round / combat system)
+	local remoteCount = 0
+	pcall(function()
+		for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+			if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+				remoteCount += 1
+				if remoteCount >= CONFIG.SCAN_CAPS.RemoteStorage then break end
+			end
+		end
+	end)
+	info.remoteCount = remoteCount
+
+	-- Terrain
+	pcall(function()
+		local e = workspace.Terrain.MaxExtents
+		info.terrainSize = math.max(e.Max.X - e.Min.X, e.Max.Z - e.Min.Z)
+		info.hasTerrain  = info.terrainSize > 64
+	end)
+
+	-- Parts (จาก Scene ที่มีอยู่)
+	info.partCount = Scene.parts
+
+	-- Round signature
+	info.hasRoundSys = anyDescendantNamed(ReplicatedStorage,
+		{ "round", "gamestate", "matchstate", "match" }, CONFIG.SCAN_CAPS.RoundPattern)
+
+	-- Signature + confidence
+	local sig, conf = "Unknown", 0
+	if info.hasTeams and info.teamCount >= 2 and (Scene.humanoids >= 4 or info.maxPlayers >= 8) then
+		sig, conf = "TeamCombat", 70
+	elseif info.hasRoundSys and remoteCount >= 5 then
+		sig, conf = "RoundBased", 65
+	elseif Scene.balls >= 1 and info.hasLeaderstats then
+		sig, conf = "SportsSimulator", 60
+	elseif info.hasTerrain and info.terrainSize >= 1000 and workspace.StreamingEnabled then
+		sig, conf = "OpenWorld", 75
+	elseif info.hasLeaderstats and Scene.balls == 0 then
+		sig, conf = "Simulator", 55
+	elseif Metrics.active >= 200 then
+		sig, conf = "HeavyVFX", 60
+	end
+	info.signature, info.confidence = sig, conf
 end
 
 --==================================================================================================
@@ -745,6 +757,15 @@ local function sampleNetwork()
 	Net.send = okS and s2 or nil
 end
 
+local function targetFps()
+	local p = Auto.peak
+	if p <= 0 then return 60 end
+	if p < 40 then return 30 end
+	if p < 75 then return 60 end
+	if p < 100 then return 90 end
+	return 120
+end
+
 local function perfLabel()
 	if Perf.fps <= 0 then return "Measuring…", C.dim end
 	local ratio = Perf.fps / targetFps()
@@ -766,7 +787,138 @@ local function updateCounts()
 end
 
 --==================================================================================================
--- 8) ADAPTIVE SETTINGS ENGINE
+-- 8) SMART PROFILE DETECTION (VFX + MAP SIGNALS)
+--==================================================================================================
+local function evaluateProfile()
+	local m, sc, mi = Metrics, Scene, MapInfo
+	local scores = { Combat = 0, Sports = 0, OpenWorld = 0, Simulator = 0, HeavyVFX = 0 }
+	local why = { Combat = {}, Sports = {}, OpenWorld = {}, Simulator = {}, HeavyVFX = {} }
+	local function add(p, pts, text) scores[p] += pts; why[p][#why[p] + 1] = text end
+
+	local fxTotal = m.emitters + m.trails + m.beams
+	local charRatio = (fxTotal > 0) and (m.charFx / fxTotal) or 0
+
+	-- VFX-driven signals ------------------------------------------------
+	if fxTotal >= 8 and charRatio >= 0.35 then add("Combat", 3, string.format("%d%% of effects attach to characters", math.floor(charRatio * 100))) end
+	if m.tools >= 2 then add("Combat", 2, string.format("%d tools equipped/owned", m.tools)) end
+	if sc.humanoids >= 4 then add("Combat", 1, string.format("%d characters/NPCs present", sc.humanoids)) end
+
+	if sc.balls >= 1 and sc.balls <= 4 then add("Sports", 3, string.format("%d ball-shaped moving object(s)", sc.balls)) end
+	if m.objectFx >= 1 and sc.balls >= 1 then add("Sports", 1, "effects attached to moving objects") end
+	if sc.humanoids >= 6 and sc.balls >= 1 then add("Sports", 1, "many players around a ball") end
+
+	if sc.extent >= 2500 then add("OpenWorld", 3, string.format("world spans ~%d studs", math.floor(sc.extent))) end
+	if workspace.StreamingEnabled then add("OpenWorld", 2, "StreamingEnabled is on") end
+	if sc.terrainSpan >= 200 then add("OpenWorld", 2, "large terrain area") end
+	if sc.parts >= 20000 then add("OpenWorld", 1, string.format("%d parts loaded", sc.parts)) end
+
+	if m.maxRep >= 15 and m.repRatio >= 0.4 then
+		add("Simulator", 3, string.format("%d identical emitters repeated (%d%% of all)", m.maxRep, math.floor(m.repRatio * 100)))
+	end
+	if player:FindFirstChild("leaderstats") then add("Simulator", 1, "leaderstats present") end
+	if m.ambientFx >= 40 then add("Simulator", 1, string.format("%d world-placed effects", m.ambientFx)) end
+
+	if m.active >= 250 then add("HeavyVFX", 3, string.format("%d active emitters", m.active))
+	elseif m.active >= 120 then add("HeavyVFX", 2, string.format("%d active emitters", m.active)) end
+	if m.rateSum >= 4000 then add("HeavyVFX", 3, string.format("%dk particles/s requested", math.floor(m.rateSum / 1000)))
+	elseif m.rateSum >= 1500 then add("HeavyVFX", 2, string.format("%.1fk particles/s requested", m.rateSum / 1000)) end
+	if m.post >= 4 then add("HeavyVFX", 1, string.format("%d lighting effects", m.post)) end
+	if m.trails + m.beams >= 100 then add("HeavyVFX", 1, string.format("%d trails/beams", m.trails + m.beams)) end
+	if Auto.lowSecs >= 10 and fxTotal >= 60 then add("HeavyVFX", 2, "FPS below target while many effects are active") end
+
+	-- MAP STRUCTURE PRIORS (boost, ไม่ override) ------------------------
+	if mi.hasTeams and mi.teamCount >= 2 then
+		add("Combat", 2, string.format("%d teams detected", mi.teamCount))
+	end
+	if mi.hasRoundSys then
+		add("Combat", 1, "round/game-state system found")
+	end
+	if mi.signature == "RoundBased" and mi.confidence >= 60 then
+		add("Combat", 2, "round-based experience")
+	end
+	if mi.signature == "SportsSimulator" then
+		add("Sports", 2, "sports simulator signature")
+	end
+	if mi.hasTerrain and mi.terrainSize >= 1000 then
+		add("OpenWorld", 2, string.format("terrain %.0f studs", mi.terrainSize))
+	end
+	if workspace.StreamingEnabled and mi.partCount >= 15000 then
+		add("OpenWorld", 1, "large streamed world")
+	end
+	if mi.hasLeaderstats and m.maxRep >= 10 then
+		add("Simulator", 2, "leaderstats + repeated emitters")
+	end
+	if mi.hasShop then
+		add("Simulator", 1, "shop UI present")
+	end
+	if mi.remoteCount >= 20 and m.active >= 100 then
+		add("HeavyVFX", 1, string.format("%d remotes + heavy FX", mi.remoteCount))
+	end
+
+	local best, bestScore = "General", 0
+	for _, p in ipairs({ "Combat", "Sports", "OpenWorld", "Simulator" }) do
+		if scores[p] > bestScore then best, bestScore = p, scores[p] end
+	end
+	if bestScore < 3 then best = "General" end
+	local genre = best
+	if scores.HeavyVFX >= 4 then best = "HeavyVFX" end
+
+	Detect.scores = scores
+	local reason
+	if best == "General" then
+		reason = "No strong genre signature, using balanced defaults"
+	else
+		local parts = {}
+		for i = 1, math.min(3, #why[best]) do parts[i] = why[best][i] end
+		reason = table.concat(parts, "; ")
+		if best == "HeavyVFX" and genre ~= "General" then
+			reason ..= " (also resembles " .. PROFILES[genre].display .. ")"
+		end
+	end
+	if sc.preserved > 0 then reason ..= string.format(" · %d protected indicators", sc.preserved) end
+	return best, reason
+end
+
+local function baselineLevel(profileKey)
+	local base = (isMobile and 2 or 1) + PROFILES[profileKey].bias
+
+	-- แมพใหญ่ + streaming → เริ่ม Conservative ขึ้น 1 ระดับ
+	if MapInfo.partCount >= 20000 and workspace.StreamingEnabled then
+		base += 1
+	end
+	-- Server มีผู้เล่นเยอะ → aggressive ขึ้น
+	if MapInfo.playerCount >= 8 then
+		base += 1
+	elseif MapInfo.playerCount >= 4 then
+		base += 0.5
+		base = math.floor(base + 0.5)
+	end
+
+	return math.clamp(base, 1, 4)
+end
+
+local function runDetection(initial, now)
+	local best, reason = evaluateProfile()
+	if initial then
+		Detect.profile, Detect.reason, Detect.lastChange, Detect.pending, Detect.pendingCount = best, reason, now, nil, 0
+		Auto.level = baselineLevel(best)
+		return true
+	end
+	if best == Detect.profile then
+		Detect.reason, Detect.pending, Detect.pendingCount = reason, nil, 0
+		return false
+	end
+	if Detect.pending == best then Detect.pendingCount += 1 else Detect.pending, Detect.pendingCount = best, 1 end
+	if Detect.pendingCount >= 3 and now - Detect.lastChange >= 60 then
+		Detect.profile, Detect.reason, Detect.lastChange, Detect.pending, Detect.pendingCount = best, reason, now, nil, 0
+		Auto.level = math.max(Auto.level, baselineLevel(best))
+		return true
+	end
+	return false
+end
+
+--==================================================================================================
+-- 9) ADAPTIVE SETTINGS ENGINE
 --==================================================================================================
 local function resolveActive()
 	local profile = Detect.profile
@@ -800,10 +952,9 @@ local function autoStep(now)
 		Auto.low, Auto.high, Auto.pending = 0, 0, nil
 		return
 	end
-	if now - startTime < 8 or Perf.fps < 5 then return end -- warm-up / paused window
+	if now - startTime < 8 or Perf.fps < 5 then return end
 	local target = targetFps()
 
-	-- Did the last increase actually help? If not, the bottleneck isn't VFX: undo it.
 	if Auto.pending and now >= Auto.pending.at + 10 then
 		local p = Auto.pending
 		Auto.pending = nil
@@ -820,17 +971,15 @@ local function autoStep(now)
 	elseif Perf.fps > target * 0.95 then Auto.high += 1; Auto.low = 0
 	else Auto.low, Auto.high = 0, 0 end
 
-	if now - Auto.lastChange < 8 then return end -- cooldown
+	if now - Auto.lastChange < 8 then return end
 
 	if Auto.low >= 3 and Active.level < 4 and now >= Auto.noRaiseUntil then
 		if Auto.lastDown and now - Auto.lastDown < 90 then
-			-- we stepped down recently and FPS fell again: that reduction was too weak
 			Auto.floorLevel, Auto.floorUntil = Active.level + 1, now + 180
 		end
 		Auto.pending = { from = Active.level, fpsBefore = Perf.fps, at = now }
 		setAutoLevel(Active.level + 1, now)
 	elseif Auto.high >= 15 and Active.level > 1 then
-		-- FPS is comfortably at target: reduction may be more aggressive than needed
 		local floor = (now < Auto.floorUntil) and Auto.floorLevel or 1
 		if Active.level - 1 >= floor then
 			Auto.lastDown = now
@@ -840,7 +989,7 @@ local function autoStep(now)
 end
 
 --==================================================================================================
--- 9) USER INTERFACE
+-- 10) USER INTERFACE
 --==================================================================================================
 local function buildUI()
 	local gui = make("ScreenGui", {
@@ -861,7 +1010,6 @@ local function buildUI()
 	local stroke = make("UIStroke", { Thickness = 1.5, Color = Color3.new(1, 1, 1), Transparency = 0.25 }, window)
 	make("UIGradient", { Color = ColorSequence.new(C.green, C.blue), Rotation = 45 }, stroke)
 
-	-- Title bar ------------------------------------------------------------------------------
 	local titleBar = make("Frame", { Name = "TitleBar", Size = UDim2.new(1, 0, 0, TITLE_H),
 		BackgroundColor3 = C.panel, BorderSizePixel = 0 }, window)
 	local dot = make("Frame", { Size = UDim2.fromOffset(10, 10), Position = UDim2.new(0, 14, 0.5, -5),
@@ -884,7 +1032,6 @@ local function buildUI()
 	local minBtn = titleButton("–", -74)
 	local closeBtn = titleButton("×", -38, C.red)
 
-	-- Body ----------------------------------------------------------------------------------------
 	local body = make("ScrollingFrame", {
 		Name = "Body", Position = UDim2.fromOffset(0, TITLE_H), Size = UDim2.new(1, 0, 1, -TITLE_H),
 		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = C.blue,
@@ -954,10 +1101,10 @@ local function buildUI()
 	end
 
 	-- 4) Why this profile ------------------------------------------------------------------------------------
-	local whyCard = card(84, 4)
+	local whyCard = card(110, 4)
 	caption(whyCard, "WHY THIS PROFILE")
 	local whyText = label(whyCard, { Text = "", TextSize = 11, TextColor3 = C.text, TextWrapped = true,
-		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 22), Size = UDim2.new(1, -20, 0, 58) })
+		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 22), Size = UDim2.new(1, -20, 0, 84) })
 
 	-- Toggle builder (whole row is the hit target: touch friendly) ---------------------------------------------------
 	local function makeToggle(order, text, sub, initial, onChange)
@@ -1082,7 +1229,6 @@ local function buildUI()
 	list:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(resize)
 	track(gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(resize))
 
-	-- Close (tap twice to confirm: it restores everything and removes the booster) -----------------------------------------------------------------
 	local armed = false
 	closeBtn.Activated:Connect(function()
 		if armed then closeAll() return end
@@ -1096,7 +1242,6 @@ local function buildUI()
 		end)
 	end)
 
-	-- Dragging (mouse + touch, clamped to screen) -------------------------------------------------------------------------------------------------------
 	local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
 	titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -1178,12 +1323,14 @@ local function buildUI()
 			setText(netLine2, "Ping is not available on this client.")
 		end
 
-		-- Dashboard
 		if State.enabled then setRow("Booster", "Enabled", C.green) else setRow("Booster", "Off · originals restored", C.off) end
 		setRow("Mode", MODE_NAMES[State.mode], (State.mode == "Auto") and C.blue or C.green)
 		local prof = PROFILES[Active.profile]
 		local manual = (State.mode == "Custom" and State.profileChoice ~= "Auto")
-		setRow("Profile", prof.tag .. " · " .. prof.display .. (manual and " (manual)" or ""), C.green)
+		local sigTxt = (MapInfo.signature ~= "Unknown")
+			and string.format(" [%s %d%%]", MapInfo.signature, MapInfo.confidence)
+			or ""
+		setRow("Profile", prof.tag .. " · " .. prof.display .. sigTxt .. (manual and " (manual)" or ""), C.green)
 		setRow("VFX level", LEVELS[Active.level].name .. ((State.mode == "Auto") and " · adaptive" or ""),
 			State.enabled and C.green or C.off)
 		local wl = Detect.workload
@@ -1197,14 +1344,15 @@ local function buildUI()
 
 		local whyLine = manual and "Profile chosen manually; detection continues in the background."
 			or Detect.reason
-		setText(whyText, whyLine .. "\nBottleneck: " .. Auto.bottleneck)
+		local mapLine = "Map: " .. (MapInfo.placeName ~= "" and MapInfo.placeName or ("PlaceId " .. MapInfo.placeId))
+			.. string.format(" · %d players · %d parts", MapInfo.playerCount, MapInfo.partCount)
+		setText(whyText, whyLine .. "\n" .. mapLine .. "\nBottleneck: " .. Auto.bottleneck)
 
 		local choice = State.profileChoice
 		setText(profLabel, (choice == "Auto") and ("Auto → " .. PROFILES[Detect.profile].tag .. " · " .. PROFILES[Detect.profile].display)
 			or (PROFILES[choice].tag .. " · " .. PROFILES[choice].display))
 	end
 
-	-- Entrance animation
 	window.BackgroundTransparency = 1
 	tween(window, 0.35, { BackgroundTransparency = 0 })
 	api.syncControls(true)
@@ -1214,7 +1362,7 @@ local function buildUI()
 end
 
 --==================================================================================================
--- 10) CONTROLS
+-- 11) CONTROLS
 --==================================================================================================
 setEnabled = function(v)
 	State.enabled = v and true or false
@@ -1241,7 +1389,7 @@ cycleProfile = function(dir)
 	State.profileChoice = PROFILE_CHOICES[idx]
 	if State.mode ~= "Custom" then
 		State.customLevel = Active.level
-		State.mode = "Custom" -- a manual profile is a manual override
+		State.mode = "Custom"
 	end
 	refresh()
 end
@@ -1259,7 +1407,7 @@ restoreAll = function()
 end
 
 --==================================================================================================
--- 11) SHUTDOWN + INITIALIZATION
+-- 12) SHUTDOWN + INITIALIZATION
 --==================================================================================================
 local function destroy()
 	if not running then return end
@@ -1270,7 +1418,7 @@ local function destroy()
 	for _, c in ipairs(IFrame.conns) do pcall(function() c:Disconnect() end) end
 	table.clear(IFrame.conns)
 
-	State.enabled = false -- synchronous restore of every saved original
+	State.enabled = false
 	local all = {}
 	for inst in pairs(records) do all[#all + 1] = inst end
 	for _, inst in ipairs(all) do pcall(processAny, inst) end
@@ -1309,6 +1457,9 @@ local function startMonitor()
 				Perf.hitchShown, Perf.hitches = Perf.hitches, 0
 				pcall(function() Perf.memMb = Stats:GetTotalMemoryUsageMb() end)
 			end
+			if tick % CONFIG.MAP_SCAN_INTERVAL == 0 then
+				pcall(scanMapInfo)
+			end
 			if tick % 30 == 0 then
 				pcall(updateMetrics)
 				local ok, switched = pcall(runDetection, false, now)
@@ -1320,7 +1471,6 @@ local function startMonitor()
 end
 
 local function init()
-	-- Listeners first, so nothing added during the scan is missed.
 	track(workspace.DescendantAdded:Connect(onDescendantAdded))
 	track(Lighting.DescendantAdded:Connect(onDescendantAdded))
 	track(RunService.Heartbeat:Connect(function()
@@ -1332,7 +1482,7 @@ local function init()
 			n += 1
 		end
 	end))
-	track(RunService.RenderStepped:Connect(function(dt) -- arithmetic only
+	track(RunService.RenderStepped:Connect(function(dt)
 		Perf.frames += 1
 		Perf.acc += dt
 		if dt > Perf.maxDt then Perf.maxDt = dt end
@@ -1341,18 +1491,18 @@ local function init()
 
 	UI = buildUI()
 
-	-- Analyze the experience (registers effects + gathers scene stats; applies nothing yet).
 	scanRoot(Lighting)
 	scanRoot(workspace)
 	finishScene()
 	updateMetrics()
 	updateCounts()
 
-	-- Pick the profile + starting level from what was actually observed.
+	-- Map intelligence (structural signals only)
+	pcall(scanMapInfo)
+
 	runDetection(true, os.clock())
 	Active.level, Active.profile = resolveActive()
 
-	-- Apply once, to completion, before announcing success.
 	generation += 1
 	runPass(generation)
 	ready = true
@@ -1372,6 +1522,6 @@ if ok then
 	end)
 else
 	warn("[FPSBoosterV2] Initialization failed: " .. tostring(err))
-	pcall(destroy) -- restore anything partially applied
+	pcall(destroy)
 	task.spawn(notify, "FPS BOOSTER V2", "Initialization failed: " .. string.sub(tostring(err), 1, 120), 8)
 end
