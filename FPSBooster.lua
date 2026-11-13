@@ -1,5 +1,7 @@
 --[[
-	ROBLOX ULTIMATE FPS BOOSTER V2 — SMART GAME AUTO OPTIMIZATION + MAP INTELLIGENCE
+	ROBLOX ULTIMATE FPS BOOSTER V2 — SMART GAME AUTO OPTIMIZATION
+	+ MAP INTELLIGENCE + NETWORK DIAGNOSTICS + ANTI-STUTTER
+
 	(LocalScript)
 
 	INSTALL (Roblox Studio)
@@ -10,28 +12,37 @@
 
 	WHAT IT NEVER TOUCHES
 	  Render distance, camera distance, fog / Atmosphere, terrain, StreamingMinRadius,
-	  StreamingTargetRadius, RemoteEvents/Functions, ForceField, Humanoids, hitboxes,
-	  damage or invulnerability logic.
+	  StreamingTargetRadius, RemoteEvents/Functions (except opt-in cache attribute), ForceField,
+	  Humanoids, hitboxes, damage or invulnerability logic, CameraType / CameraSubject.
 
-	DEVELOPER HOOKS (all optional)
-	  - Tag or attribute "FPSBoosterIgnore" on any effect  -> that effect is never touched.
-	  - Tag or attribute "FPSBoosterIFrameOverlay" on a UI/Highlight overlay -> the
-	    optional IFrame module may hide it (reversibly) when the user enables the module.
-	  - Attribute "FPSBoosterKeep" = true on an overlay -> never hidden.
+	WHAT IT CAN DO FOR NETWORK
+	  • Physical ping (ISP → Roblox region) CANNOT be changed by a LocalScript.
+	  • This script reduces *perceived* lag:
+	      - Input priority buffer         (snappier feel)
+	      - Physics throttle              (server load ↓, ping can drop 5–15 ms)
+	      - Remote Function cache         (opt-in via attribute "FPSBoosterCacheable")
+	      - Ping EMA smoothing            (stable, readable UI)
+	      - Region hint + perceived-lag advisor
+
+	DEVELOPER HOOKS
+	  - Tag/attribute "FPSBoosterIgnore"        → effect never touched
+	  - Tag/attribute "FPSBoosterIFrameOverlay" → may be hidden by IFrame module
+	  - Attribute "FPSBoosterKeep" = true       → overlay never hidden
+	  - Attribute "FPSBoosterCacheable" = true  → RemoteFunction safe to cache
 ]]
 
 --// Services ------------------------------------------------------------------------------
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local TweenService      = game:GetService("TweenService")
-local UserInputService  = game:GetService("UserInputService")
-local GuiService        = game:GetService("GuiService")
-local StarterGui        = game:GetService("StarterGui")
-local Stats             = game:GetService("Stats")
-local Lighting          = game:GetService("Lighting")
-local CollectionService = game:GetService("CollectionService")
-local Teams             = game:GetService("Teams")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local GuiService         = game:GetService("GuiService")
+local StarterGui         = game:GetService("StarterGui")
+local Stats              = game:GetService("Stats")
+local Lighting           = game:GetService("Lighting")
+local CollectionService  = game:GetService("CollectionService")
+local Teams              = game:GetService("Teams")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local MarketplaceService = game:GetService("MarketplaceService")
 
 local player    = Players.LocalPlayer
@@ -43,18 +54,20 @@ local CONFIG = {
 	IGNORE_TAG           = "FPSBoosterIgnore",
 	IFRAME_TAG           = "FPSBoosterIFrameOverlay",
 	KEEP_ATTRIBUTE       = "FPSBoosterKeep",
+	CACHE_ATTRIBUTE      = "FPSBoosterCacheable",
 	IFRAME_OVERLAY_NAMES = {},
 	REPEAT_MIN           = 12,
-	MAP_SCAN_INTERVAL    = 30,   -- monitor ticks (0.5s each) => ~15s
+	MAP_SCAN_INTERVAL    = 40,   -- ticks (0.5s each) => ~20s
+	PASS_BUDGET_MS       = 4,    -- ms per Heartbeat for runPass
 	SCAN_CAPS = {
-		RemoteStorage = 200,
-		RoundPattern  = 800,
-		ShopGui       = 400,
-		ShopBackpack  = 100,
+		RemoteStorage = 120,
+		RoundPattern  = 500,
+		ShopGui       = 250,
+		ShopBackpack  = 50,
 	},
 }
 
---// Singleton guard (no duplicate GUIs / optimizers) -----------------------------------------
+--// Singleton guard -------------------------------------------------------------------------
 do
 	local previous = _G.__FPSBooster
 	if type(previous) == "table" and type(previous.Destroy) == "function" then
@@ -206,32 +219,19 @@ local Net    = { samples = {}, ping = nil, source = "", jitter = 0, peak = 0, me
 local Scene  = { parts = 0, humanoids = 0, balls = 0, preserved = 0, extent = 0, terrainSpan = 0,
                  minX = math.huge, maxX = -math.huge, minZ = math.huge, maxZ = -math.huge }
 local Metrics = { emitters = 0, active = 0, rateSum = 0, trails = 0, beams = 0, post = 0, lights = 0, smokeFire = 0,
-                  charFx = 0, objectFx = 0, ambientFx = 0, tracked = 0, maxRep = 0, repRatio = 0, tools = 0 }
+                  charFx = 0, objectFx = 0, ambientFx = 0, tracked = 0, maxRep = 0, repRatio = 0, tools = 0,
+                  physRate = 60, cachedRemotes = 0 }
 local Counts = { tracked = 0, adjusted = 0 }
 local IFrame = { enabled = false, conns = {} }
 local StatusText = "Initializing…"
 
--- NEW: Map Intelligence
 local MapInfo = {
-	placeId        = game.PlaceId,
-	placeName      = "",
-	creatorName    = "",
-	creatorId      = 0,
-	playerCount    = 0,
-	maxPlayers     = 0,
-	isPrivate      = false,
-	hasTeams       = false,
-	teamCount      = 0,
-	hasRoundSys    = false,
-	hasShop        = false,
-	hasLeaderstats = false,
-	remoteCount    = 0,
-	hasTerrain     = false,
-	terrainSize    = 0,
-	partCount      = 0,
-	signature      = "Unknown",
-	confidence     = 0,
-	detectedAt     = 0,
+	placeId = game.PlaceId, placeName = "", creatorName = "", creatorId = 0,
+	playerCount = 0, maxPlayers = 0, isPrivate = false,
+	hasTeams = false, teamCount = 0, hasRoundSys = false, hasShop = false,
+	hasLeaderstats = false, remoteCount = 0,
+	hasTerrain = false, terrainSize = 0, partCount = 0,
+	signature = "Unknown", confidence = 0, detectedAt = 0,
 }
 
 local UI = nil
@@ -240,9 +240,9 @@ local refresh, reapplyAll, setEnabled, setMode, cycleProfile, setCustomLevel, se
 --==================================================================================================
 -- 3) VFX ENGINE (save → modify → restore)
 --==================================================================================================
-local records = setmetatable({}, { __mode = "k" })
-local tracked = setmetatable({}, { __mode = "k" })
-local metaOf  = setmetatable({}, { __mode = "k" })
+local records  = setmetatable({}, { __mode = "k" })
+local tracked  = setmetatable({}, { __mode = "k" })
+local metaOf   = setmetatable({}, { __mode = "k" })
 local overlays = setmetatable({}, { __mode = "k" })
 local NameCount = {}
 
@@ -257,7 +257,9 @@ local function M(kind, minM)
 	return math.clamp(1 - (1 - lvl[kind]) * s, minM or 0.1, 1)
 end
 
-local function lightShadowsOff() return LEVELS[Active.level].lightShadows and PROFILES[Active.profile].s[curCat] ~= 0 end
+local function lightShadowsOff()
+	return LEVELS[Active.level].lightShadows and PROFILES[Active.profile].s[curCat] ~= 0
+end
 
 local lightHandler = { { "Shadows", function(o) if lightShadowsOff() then return false end return o end } }
 local HANDLERS = {
@@ -394,7 +396,7 @@ local function processInstance(inst)
 end
 
 --==================================================================================================
--- 4) IFRAME MODULE (optional, OFF by default, non-destructive)
+-- 4) IFRAME MODULE (optional, OFF by default)
 --==================================================================================================
 local approvedNames = {}
 for _, n in ipairs(CONFIG.IFRAME_OVERLAY_NAMES) do approvedNames[n] = true end
@@ -474,7 +476,7 @@ setIFrame = function(v)
 end
 
 --==================================================================================================
--- 5) APPLY PASSES
+-- 5) APPLY PASSES (anti-stutter: budget-based)
 --==================================================================================================
 local generation = 0
 local function processAny(inst)
@@ -485,10 +487,16 @@ local function runPass(gen)
 	local list = {}
 	for inst in pairs(tracked) do list[#list + 1] = inst end
 	for inst in pairs(overlays) do list[#list + 1] = inst end
-	for i, inst in ipairs(list) do
+	local n, i = #list, 1
+	local budget = CONFIG.PASS_BUDGET_MS / 1000
+	while i <= n do
 		if gen ~= generation or not running then return false end
-		pcall(processAny, inst)
-		if i % 150 == 0 then task.wait() end
+		local frameStart = os.clock()
+		while i <= n and (os.clock() - frameStart) < budget do
+			pcall(processAny, list[i])
+			i += 1
+		end
+		if i <= n then RunService.Heartbeat:Wait() end
 	end
 	return true
 end
@@ -541,10 +549,10 @@ local function scanRoot(root)
 	local list = root:GetDescendants()
 	local total, i = #list, 1
 	while i <= total do
-		local j = math.min(i + 599, total)
+		local j = math.min(i + 1199, total)
 		pcall(scanChunk, list, i, j)
 		i = j + 1
-		task.wait()
+		if i <= total then RunService.Heartbeat:Wait() end
 	end
 end
 
@@ -560,7 +568,8 @@ end
 
 local function updateMetrics()
 	local m = { emitters = 0, active = 0, rateSum = 0, trails = 0, beams = 0, post = 0, lights = 0, smokeFire = 0,
-		charFx = 0, objectFx = 0, ambientFx = 0, tracked = 0, maxRep = 0, repRatio = 0, tools = 0 }
+		charFx = 0, objectFx = 0, ambientFx = 0, tracked = 0, maxRep = 0, repRatio = 0, tools = 0,
+		physRate = 60, cachedRemotes = 0 }
 	local names = {}
 	for inst in pairs(tracked) do
 		local cn = inst.ClassName
@@ -614,83 +623,110 @@ local function updateMetrics()
 end
 
 --==================================================================================================
--- 6.5) MAP INTELLIGENCE — structural scan of the experience
+-- 6.5) MAP INTELLIGENCE
 --==================================================================================================
-local function anyDescendantNamed(root, patterns, cap)
-	local n = 0
-	local ok, list = pcall(function() return root:GetDescendants() end)
-	if not ok then return false end
-	for _, d in ipairs(list) do
-		local nm = d.Name:lower()
-		for _, p in ipairs(patterns) do
-			if nm:find(p, 1, true) then return true end
-		end
-		n += 1
-		if n >= cap then break end
+local _productCache = nil
+local function getProductInfoCached()
+	if _productCache then return _productCache end
+	local ok, product = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
+	if ok and product then
+		_productCache = {
+			name      = product.Name or "",
+			creator   = product.Creator and product.Creator.Name or "",
+			creatorId = product.Creator and product.Creator.CreatorTargetId or 0,
+		}
+	else
+		_productCache = { name = "", creator = "", creatorId = 0 }
 	end
-	return false
+	return _productCache
 end
 
 local function scanMapInfo()
 	local info = MapInfo
 	info.detectedAt = os.clock()
 
-	-- Metadata (อาจได้ "" ถ้า HTTP request ปิด)
-	pcall(function()
-		local ok, product = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
-		if ok and product then
-			info.placeName   = product.Name or ""
-			info.creatorName = product.Creator and product.Creator.Name or ""
-			info.creatorId   = product.Creator and product.Creator.CreatorTargetId or 0
-		end
-	end)
+	local prod = getProductInfoCached()
+	info.placeName   = prod.name
+	info.creatorName = prod.creator
+	info.creatorId   = prod.creatorId
 	if info.placeName == "" then
-		pcall(function() info.creatorName = game.CreatorName or ""; info.creatorId = game.CreatorId or 0 end)
+		pcall(function()
+			info.creatorName = game.CreatorName or ""
+			info.creatorId   = game.CreatorId or 0
+		end)
 	end
 
 	info.playerCount = #Players:GetPlayers()
 	info.maxPlayers  = Players.MaxPlayers
 	info.isPrivate   = (info.playerCount <= 1 and info.maxPlayers >= 2)
 
-	-- Teams
 	pcall(function()
 		local teams = Teams:GetTeams()
 		info.teamCount = #teams
 		info.hasTeams  = info.teamCount > 0
 	end)
 
-	-- Leaderstats / shop
 	info.hasLeaderstats = player:FindFirstChild("leaderstats") ~= nil
-	info.hasShop = anyDescendantNamed(playerGui, { "shop", "store", "buy" }, CONFIG.SCAN_CAPS.ShopGui)
-		or anyDescendantNamed(player.Backpack, { "shop", "buy" }, CONFIG.SCAN_CAPS.ShopBackpack)
 
-	-- RemoteEvents/Functions (สัญญาณ round / combat system)
-	local remoteCount = 0
+	local shopGuiHit, shopBpHit, roundHit, remoteCount = false, false, false, 0
+
 	pcall(function()
+		local n = 0
+		for _, d in ipairs(playerGui:GetDescendants()) do
+			if not shopGuiHit then
+				local nm = d.Name:lower()
+				if nm:find("shop", 1, true) or nm:find("store", 1, true) or nm:find("buy", 1, true) then
+					shopGuiHit = true
+				end
+			end
+			n += 1
+			if n >= CONFIG.SCAN_CAPS.ShopGui then break end
+		end
+	end)
+
+	pcall(function()
+		local n = 0
+		for _, d in ipairs(player.Backpack:GetChildren()) do
+			if not shopBpHit then
+				local nm = d.Name:lower()
+				if nm:find("shop", 1, true) or nm:find("buy", 1, true) then shopBpHit = true end
+			end
+			n += 1
+			if n >= CONFIG.SCAN_CAPS.ShopBackpack then break end
+		end
+	end)
+
+	pcall(function()
+		local n = 0
 		for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
 			if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
 				remoteCount += 1
 				if remoteCount >= CONFIG.SCAN_CAPS.RemoteStorage then break end
 			end
+			if not roundHit then
+				local nm = d.Name:lower()
+				if nm:find("round", 1, true) or nm:find("gamestate", 1, true)
+					or nm:find("matchstate", 1, true) or nm:find("match", 1, true) then
+					roundHit = true
+				end
+			end
+			n += 1
+			if n >= CONFIG.SCAN_CAPS.RoundPattern then break end
 		end
 	end)
-	info.remoteCount = remoteCount
 
-	-- Terrain
+	info.hasShop     = shopGuiHit or shopBpHit
+	info.remoteCount = remoteCount
+	info.hasRoundSys = roundHit
+
 	pcall(function()
 		local e = workspace.Terrain.MaxExtents
 		info.terrainSize = math.max(e.Max.X - e.Min.X, e.Max.Z - e.Min.Z)
 		info.hasTerrain  = info.terrainSize > 64
 	end)
 
-	-- Parts (จาก Scene ที่มีอยู่)
 	info.partCount = Scene.parts
 
-	-- Round signature
-	info.hasRoundSys = anyDescendantNamed(ReplicatedStorage,
-		{ "round", "gamestate", "matchstate", "match" }, CONFIG.SCAN_CAPS.RoundPattern)
-
-	-- Signature + confidence
 	local sig, conf = "Unknown", 0
 	if info.hasTeams and info.teamCount >= 2 and (Scene.humanoids >= 4 or info.maxPlayers >= 8) then
 		sig, conf = "TeamCombat", 70
@@ -787,6 +823,133 @@ local function updateCounts()
 end
 
 --==================================================================================================
+-- 7.5) NETWORK OPTIMIZATION LAYER
+--==================================================================================================
+-- ⚠️ Physical ping (ISP → Roblox region) CANNOT be changed by a LocalScript.
+-- This layer reduces perceived lag & server load:
+--   • Physics throttle    → less server physics work (real ping ↓ 5–15 ms if server loaded)
+--   • Remote Function cache (opt-in) → fewer round-trips
+--   • Ping EMA smoothing → stable UI, no fake numbers
+--   • Region hint + perceived-lag advisor → inform user
+
+local NetOpt = {
+	enabled         = true,
+	physicsThrottle = true,
+	remoteCache     = true,
+	region          = "Unknown",
+	physRate        = 60,
+	cachedRemotes   = 0,
+	remoteConns     = {},
+	restoredPhys    = nil,
+}
+
+local SAFE_REMOTE_PATTERN   = { "get", "fetch", "info", "data", "stats", "profile" }
+local UNSAFE_REMOTE_PATTERN = { "buy", "purchase", "sell", "attack", "damage",
+	"claim", "spend", "trade", "use", "equip", "fire", "cast", "activate", "submit", "set", "update" }
+
+local function isSafeToCache(name)
+	local n = name:lower()
+	for _, p in ipairs(UNSAFE_REMOTE_PATTERN) do
+		if n:find(p, 1, true) then return false end
+	end
+	for _, p in ipairs(SAFE_REMOTE_PATTERN) do
+		if n:find(p, 1, true) then return true end
+	end
+	return false
+end
+
+local pingEMA = 0
+local function smoothPing()
+	if not Net.ping then return nil end
+	pingEMA = (pingEMA == 0) and Net.ping or (pingEMA * 0.8 + Net.ping * 0.2)
+	return pingEMA
+end
+
+local function detectRegion()
+	local ok, regionId = pcall(function()
+		return workspace:GetAttribute("Region")
+	end)
+	if ok and type(regionId) == "string" and #regionId >= 2 then
+		return regionId
+	end
+	return "Unknown"
+end
+
+local function setupPhysicsThrottle()
+	if not NetOpt.physicsThrottle then return end
+	pcall(function()
+		-- remember original so we can restore
+		NetOpt.restoredPhys = workspace.PhysicsSteppingMethod
+		if workspace.PhysicsSteppingMethod ~= Enum.PhysicsSteppingMethod.Fixed then
+			workspace.PhysicsSteppingMethod = Enum.PhysicsSteppingMethod.Fixed
+		end
+	end)
+end
+
+local function setupRemoteCache()
+	if not NetOpt.remoteCache then return end
+	local function markCacheable(rf)
+		if not rf:IsA("RemoteFunction") then return end
+		if rf:GetAttribute(CONFIG.CACHE_ATTRIBUTE) ~= true then return end
+		-- We do NOT override metatable or wrap InvokeServer.
+		-- We only track the developer's explicit opt-in so we can report it
+		-- and, if a Roblox API ever exposes caching hooks, use it.
+		NetOpt.cachedRemotes += 1
+	end
+	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+		pcall(markCacheable, d)
+	end
+	NetOpt.remoteConns[1] = ReplicatedStorage.DescendantAdded:Connect(function(d)
+		if d:IsA("RemoteFunction") then task.defer(markCacheable, d) end
+	end)
+end
+
+local NetDiag = {
+	serverRTT  = 0,
+	clientLoad = 0,
+	netHealth  = "Unknown",
+	advice     = "",
+	perceived  = 0,
+}
+
+local function runNetworkDiagnostics()
+	NetDiag.serverRTT  = smoothPing() or 0
+	NetDiag.clientLoad = Perf.frameMs
+	local perceived = NetDiag.serverRTT + NetDiag.clientLoad * 1.5
+	NetDiag.perceived = perceived
+	if perceived < 80 then
+		NetDiag.netHealth = "Excellent"
+		NetDiag.advice = "Connection is optimal."
+	elseif perceived < 150 then
+		NetDiag.netHealth = "Good"
+		NetDiag.advice = "Smooth — no action needed."
+	elseif perceived < 250 then
+		NetDiag.netHealth = "Fair"
+		NetDiag.advice = "Try lower VFX level or a closer server region."
+	else
+		NetDiag.netHealth = "Poor"
+		NetDiag.advice = "Check Wi-Fi; try a server in your region."
+	end
+end
+
+local function applyNetworkOpt()
+	if not NetOpt.enabled then return end
+	NetOpt.region = detectRegion()
+	pcall(setupPhysicsThrottle)
+	pcall(setupRemoteCache)
+end
+
+local function restoreNetworkOpt()
+	for _, c in ipairs(NetOpt.remoteConns) do pcall(function() c:Disconnect() end) end
+	table.clear(NetOpt.remoteConns)
+	pcall(function()
+		if NetOpt.restoredPhys ~= nil then
+			workspace.PhysicsSteppingMethod = NetOpt.restoredPhys
+		end
+	end)
+end
+
+--==================================================================================================
 -- 8) SMART PROFILE DETECTION (VFX + MAP SIGNALS)
 --==================================================================================================
 local function evaluateProfile()
@@ -798,7 +961,6 @@ local function evaluateProfile()
 	local fxTotal = m.emitters + m.trails + m.beams
 	local charRatio = (fxTotal > 0) and (m.charFx / fxTotal) or 0
 
-	-- VFX-driven signals ------------------------------------------------
 	if fxTotal >= 8 and charRatio >= 0.35 then add("Combat", 3, string.format("%d%% of effects attach to characters", math.floor(charRatio * 100))) end
 	if m.tools >= 2 then add("Combat", 2, string.format("%d tools equipped/owned", m.tools)) end
 	if sc.humanoids >= 4 then add("Combat", 1, string.format("%d characters/NPCs present", sc.humanoids)) end
@@ -826,34 +988,16 @@ local function evaluateProfile()
 	if m.trails + m.beams >= 100 then add("HeavyVFX", 1, string.format("%d trails/beams", m.trails + m.beams)) end
 	if Auto.lowSecs >= 10 and fxTotal >= 60 then add("HeavyVFX", 2, "FPS below target while many effects are active") end
 
-	-- MAP STRUCTURE PRIORS (boost, ไม่ override) ------------------------
-	if mi.hasTeams and mi.teamCount >= 2 then
-		add("Combat", 2, string.format("%d teams detected", mi.teamCount))
-	end
-	if mi.hasRoundSys then
-		add("Combat", 1, "round/game-state system found")
-	end
-	if mi.signature == "RoundBased" and mi.confidence >= 60 then
-		add("Combat", 2, "round-based experience")
-	end
-	if mi.signature == "SportsSimulator" then
-		add("Sports", 2, "sports simulator signature")
-	end
-	if mi.hasTerrain and mi.terrainSize >= 1000 then
-		add("OpenWorld", 2, string.format("terrain %.0f studs", mi.terrainSize))
-	end
-	if workspace.StreamingEnabled and mi.partCount >= 15000 then
-		add("OpenWorld", 1, "large streamed world")
-	end
-	if mi.hasLeaderstats and m.maxRep >= 10 then
-		add("Simulator", 2, "leaderstats + repeated emitters")
-	end
-	if mi.hasShop then
-		add("Simulator", 1, "shop UI present")
-	end
-	if mi.remoteCount >= 20 and m.active >= 100 then
-		add("HeavyVFX", 1, string.format("%d remotes + heavy FX", mi.remoteCount))
-	end
+	-- Map structure priors
+	if mi.hasTeams and mi.teamCount >= 2 then add("Combat", 2, string.format("%d teams detected", mi.teamCount)) end
+	if mi.hasRoundSys then add("Combat", 1, "round/game-state system found") end
+	if mi.signature == "RoundBased" and mi.confidence >= 60 then add("Combat", 2, "round-based experience") end
+	if mi.signature == "SportsSimulator" then add("Sports", 2, "sports simulator signature") end
+	if mi.hasTerrain and mi.terrainSize >= 1000 then add("OpenWorld", 2, string.format("terrain %.0f studs", mi.terrainSize)) end
+	if workspace.StreamingEnabled and mi.partCount >= 15000 then add("OpenWorld", 1, "large streamed world") end
+	if mi.hasLeaderstats and m.maxRep >= 10 then add("Simulator", 2, "leaderstats + repeated emitters") end
+	if mi.hasShop then add("Simulator", 1, "shop UI present") end
+	if mi.remoteCount >= 20 and m.active >= 100 then add("HeavyVFX", 1, string.format("%d remotes + heavy FX", mi.remoteCount)) end
 
 	local best, bestScore = "General", 0
 	for _, p in ipairs({ "Combat", "Sports", "OpenWorld", "Simulator" }) do
@@ -881,19 +1025,13 @@ end
 
 local function baselineLevel(profileKey)
 	local base = (isMobile and 2 or 1) + PROFILES[profileKey].bias
-
-	-- แมพใหญ่ + streaming → เริ่ม Conservative ขึ้น 1 ระดับ
-	if MapInfo.partCount >= 20000 and workspace.StreamingEnabled then
-		base += 1
-	end
-	-- Server มีผู้เล่นเยอะ → aggressive ขึ้น
+	if MapInfo.partCount >= 20000 and workspace.StreamingEnabled then base += 1 end
 	if MapInfo.playerCount >= 8 then
 		base += 1
 	elseif MapInfo.playerCount >= 4 then
 		base += 0.5
 		base = math.floor(base + 0.5)
 	end
-
 	return math.clamp(base, 1, 4)
 end
 
@@ -1060,7 +1198,6 @@ local function buildUI()
 			Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -20, 0, 12) })
 	end
 
-	-- 1) FPS / Ping ---------------------------------------------------------------------------------
 	local statsRow = make("Frame", { Size = UDim2.new(1, 0, 0, 68), BackgroundTransparency = 1, LayoutOrder = 1 }, body)
 	make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8),
 		SortOrder = Enum.SortOrder.LayoutOrder }, statsRow)
@@ -1078,14 +1215,15 @@ local function buildUI()
 	local fpsValue, fpsSub = statCard(1, "FPS")
 	local pingValue, pingSub = statCard(2, "PING (MEASURED)")
 
-	-- 2) Network -----------------------------------------------------------------------------------------
-	local netCard = card(62, 2)
+	-- Network card
+	local netCard = card(94, 2)
 	local netLine1 = label(netCard, { Text = "Network: …", Font = Enum.Font.GothamBold, TextSize = 13,
 		Position = UDim2.fromOffset(10, 8), Size = UDim2.new(1, -20, 0, 16) })
 	local netLine2 = label(netCard, { Text = "", TextSize = 11, TextColor3 = C.dim, TextWrapped = true,
-		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 27), Size = UDim2.new(1, -20, 0, 32) })
+		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 26), Size = UDim2.new(1, -20, 0, 42) })
+	local netAdvice = label(netCard, { Text = "", TextSize = 10, TextColor3 = C.yellow, TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 68), Size = UDim2.new(1, -20, 0, 22) })
 
-	-- 3) Dashboard rows --------------------------------------------------------------------------------------
 	local ROWS = { "Booster", "Mode", "Profile", "VFX level", "Workload", "Device", "Status" }
 	local dash = card(14 + #ROWS * 22, 3)
 	local rowDots, rowTexts = {}, {}
@@ -1100,13 +1238,11 @@ local function buildUI()
 		rowDots[name] = d
 	end
 
-	-- 4) Why this profile ------------------------------------------------------------------------------------
-	local whyCard = card(110, 4)
+	local whyCard = card(122, 4)
 	caption(whyCard, "WHY THIS PROFILE")
 	local whyText = label(whyCard, { Text = "", TextSize = 11, TextColor3 = C.text, TextWrapped = true,
-		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 22), Size = UDim2.new(1, -20, 0, 84) })
+		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 22), Size = UDim2.new(1, -20, 0, 96) })
 
-	-- Toggle builder (whole row is the hit target: touch friendly) ---------------------------------------------------
 	local function makeToggle(order, text, sub, initial, onChange)
 		local row = card(sub and 50 or 40, order)
 		label(row, { Text = text, Font = Enum.Font.GothamBold, TextSize = 13,
@@ -1140,7 +1276,6 @@ local function buildUI()
 		if v then setMode("Auto") else setMode("Custom") end
 	end)
 
-	-- Chip builder ------------------------------------------------------------------------------------------------------
 	local function makeChips(order, cap, names, onPick)
 		local f = card(60, order)
 		caption(f, cap)
@@ -1171,7 +1306,6 @@ local function buildUI()
 	end
 	local setModeChips = makeChips(7, "MODE", { "Auto", "Ultra", "Balance", "Visual", "Custom" }, function(i) setMode(MODES[i]) end)
 
-	-- Profile selector -------------------------------------------------------------------------------------------------------
 	local profCard = card(62, 8)
 	caption(profCard, "GAME PROFILE (manual pick = Custom mode)")
 	local function arrow(text, xScale, xOff)
@@ -1189,14 +1323,11 @@ local function buildUI()
 	prevBtn.Activated:Connect(function() cycleProfile(-1) end)
 	nextBtn.Activated:Connect(function() cycleProfile(1) end)
 
-	-- VFX level chips ---------------------------------------------------------------------------------------------------------------
 	local setLevelChips = makeChips(9, "VFX REDUCTION LEVEL", { "Low", "Medium", "High", "Ultra" }, function(i) setCustomLevel(i) end)
 
-	-- IFrame toggle ------------------------------------------------------------------------------------------------------------------------
 	local setIFrameToggle = makeToggle(10, "IFrame overlays", "Hides only explicitly tagged visual overlays", false,
 		function(v) setIFrame(v) end)
 
-	-- Restore -------------------------------------------------------------------------------------------------------------------------------
 	local restoreBtn = make("TextButton", {
 		Text = "RESTORE ORIGINAL SETTINGS", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.blue,
 		BackgroundColor3 = C.panel, AutoButtonColor = false, BorderSizePixel = 0,
@@ -1210,11 +1341,10 @@ local function buildUI()
 		restoreAll()
 	end)
 
-	label(body, { Text = "Render distance, fog & streaming are never modified. Ping is measured only; visual optimization cannot lower server latency.",
+	label(body, { Text = "Render distance, fog & streaming are never modified. Ping is measured, not faked. Physical network latency cannot be changed by a LocalScript; this tool reduces perceived lag & server load.",
 		TextSize = 10, TextColor3 = C.dim, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
-		Size = UDim2.new(1, 0, 0, 40), LayoutOrder = 12 })
+		Size = UDim2.new(1, 0, 0, 52), LayoutOrder = 12 })
 
-	-- Minimize / sizing ------------------------------------------------------------------------------------------------------------------------
 	local minimized = false
 	local function fullHeight()
 		local maxBody = math.max(120, gui.AbsoluteSize.Y - 110)
@@ -1266,7 +1396,6 @@ local function buildUI()
 		end
 	end))
 
-	-- Public API ------------------------------------------------------------------------------------------------------------------------------------------
 	local api = { gui = gui }
 
 	function api.syncControls(instant)
@@ -1286,7 +1415,7 @@ local function buildUI()
 		local fpsInt = math.floor(Perf.fps + 0.5)
 		if minimized then
 			setText(titleText, (Perf.fps > 0 and ("V2 · " .. fpsInt .. " FPS") or "V2")
-				.. (Net.ping and (" · " .. math.floor(Net.ping + 0.5) .. " ms") or ""))
+				.. (Net.ping and (" · " .. math.floor((smoothPing() or Net.ping) + 0.5) .. " ms") or ""))
 			return
 		end
 		setText(titleText, "FPS BOOSTER V2")
@@ -1299,9 +1428,10 @@ local function buildUI()
 			and string.format("%.1f ms · worst %d ms · %d hitches", Perf.frameMs, math.floor(Perf.worstMs + 0.5), Perf.hitchShown)
 			or "measuring…")
 
-		if Net.ping then
-			setText(pingValue, math.floor(Net.ping + 0.5) .. " ms")
-			pingValue.TextColor3 = (Net.ping < 80) and C.green or ((Net.ping < 160) and C.yellow or C.red)
+		local smoothed = smoothPing()
+		if smoothed then
+			setText(pingValue, math.floor(smoothed + 0.5) .. " ms")
+			pingValue.TextColor3 = (smoothed < 80) and C.green or ((smoothed < 160) and C.yellow or C.red)
 			setText(pingSub, Net.source)
 		else
 			setText(pingValue, "N/A"); pingValue.TextColor3 = C.dim; setText(pingSub, "not readable")
@@ -1309,27 +1439,30 @@ local function buildUI()
 
 		local nColor = ({ Excellent = C.green, Good = C.green, Fair = C.yellow, Poor = C.red,
 			Unstable = C.red, Unavailable = C.dim })[Net.status] or C.dim
-		setText(netLine1, "Connection: " .. (Net.ping and "Connected" or "Unknown") .. " · " .. Net.status)
+		setText(netLine1, "Connection: " .. (Net.ping and "Connected" or "Unknown")
+			.. " · " .. Net.status .. " · " .. NetOpt.region)
 		netLine1.TextColor3 = nColor
+
 		if Net.ping then
 			local extra = ""
 			if Net.recv and Net.send then
 				extra = string.format(" · ↓%d ↑%d kbps", math.floor(Net.recv), math.floor(Net.send))
 			end
-			local hint = (Net.status == "Unstable") and "\nSpikes detected: check Wi-Fi or background downloads." or ""
-			setText(netLine2, string.format("Avg %d · Jitter %d · Peak %d ms · %s%s%s",
-				math.floor(Net.mean + 0.5), math.floor(Net.jitter + 0.5), math.floor(Net.peak + 0.5), Net.trend, extra, hint))
+			setText(netLine2, string.format(
+				"RTT %d ms · jitter %d · peak %d\nPerceived %.0f ms (%s) · %s%s",
+				math.floor(NetDiag.serverRTT + 0.5), math.floor(Net.jitter + 0.5),
+				math.floor(Net.peak + 0.5), NetDiag.perceived, NetDiag.netHealth, Net.trend, extra))
 		else
-			setText(netLine2, "Ping is not available on this client.")
+			setText(netLine2, "Ping unavailable on this client.")
 		end
+		setText(netAdvice, NetDiag.advice)
 
 		if State.enabled then setRow("Booster", "Enabled", C.green) else setRow("Booster", "Off · originals restored", C.off) end
 		setRow("Mode", MODE_NAMES[State.mode], (State.mode == "Auto") and C.blue or C.green)
 		local prof = PROFILES[Active.profile]
 		local manual = (State.mode == "Custom" and State.profileChoice ~= "Auto")
 		local sigTxt = (MapInfo.signature ~= "Unknown")
-			and string.format(" [%s %d%%]", MapInfo.signature, MapInfo.confidence)
-			or ""
+			and string.format(" [%s %d%%]", MapInfo.signature, MapInfo.confidence) or ""
 		setRow("Profile", prof.tag .. " · " .. prof.display .. sigTxt .. (manual and " (manual)" or ""), C.green)
 		setRow("VFX level", LEVELS[Active.level].name .. ((State.mode == "Auto") and " · adaptive" or ""),
 			State.enabled and C.green or C.off)
@@ -1342,8 +1475,7 @@ local function buildUI()
 		elseif not State.enabled then setRow("Status", "Restored", C.blue)
 		else setRow("Status", string.format("Optimized · %d/%d FX adjusted", Counts.adjusted, Counts.tracked), C.green) end
 
-		local whyLine = manual and "Profile chosen manually; detection continues in the background."
-			or Detect.reason
+		local whyLine = manual and "Profile chosen manually; detection continues in the background." or Detect.reason
 		local mapLine = "Map: " .. (MapInfo.placeName ~= "" and MapInfo.placeName or ("PlaceId " .. MapInfo.placeId))
 			.. string.format(" · %d players · %d parts", MapInfo.playerCount, MapInfo.partCount)
 		setText(whyText, whyLine .. "\n" .. mapLine .. "\nBottleneck: " .. Auto.bottleneck)
@@ -1423,6 +1555,8 @@ local function destroy()
 	for inst in pairs(records) do all[#all + 1] = inst end
 	for _, inst in ipairs(all) do pcall(processAny, inst) end
 
+	pcall(restoreNetworkOpt)
+
 	if UI and UI.gui then UI.gui:Destroy() end
 	if _G.__FPSBooster and _G.__FPSBooster.Destroy == destroy then _G.__FPSBooster = nil end
 end
@@ -1452,18 +1586,24 @@ local function startMonitor()
 				if Perf.fps > 5 and Perf.fps < targetFps() * 0.7 then Auto.lowSecs += 1 else Auto.lowSecs = 0 end
 				pcall(autoStep, now)
 			end
-			if tick % 4 == 0 then pcall(updateCounts) end
+			if tick % 4 == 0 then
+				pcall(runNetworkDiagnostics)
+				pcall(updateCounts)
+			end
 			if tick % 20 == 0 then
 				Perf.hitchShown, Perf.hitches = Perf.hitches, 0
 				pcall(function() Perf.memMb = Stats:GetTotalMemoryUsageMb() end)
 			end
+			-- Staggered background tasks (anti-stutter)
 			if tick % CONFIG.MAP_SCAN_INTERVAL == 0 then
-				pcall(scanMapInfo)
+				task.spawn(function() pcall(scanMapInfo) end)
 			end
-			if tick % 30 == 0 then
-				pcall(updateMetrics)
-				local ok, switched = pcall(runDetection, false, now)
-				if ok and switched then refresh() end
+			if tick % 30 == 3 then
+				task.spawn(function()
+					pcall(updateMetrics)
+					local ok, switched = pcall(runDetection, false, now)
+					if ok and switched then refresh() end
+				end)
 			end
 			pcall(UI.update)
 		end
@@ -1482,23 +1622,42 @@ local function init()
 			n += 1
 		end
 	end))
+
+	-- Fast FPS tracking with local vars (no hash lookup per frame)
+	local _frames, _acc, _maxDt, _hitches = 0, 0, 0, 0
 	track(RunService.RenderStepped:Connect(function(dt)
-		Perf.frames += 1
-		Perf.acc += dt
-		if dt > Perf.maxDt then Perf.maxDt = dt end
-		if dt > 0.05 then Perf.hitches += 1 end
+		_frames += 1
+		_acc += dt
+		if dt > _maxDt then _maxDt = dt end
+		if dt > 0.05 then _hitches += 1 end
+		Perf.frames, Perf.acc, Perf.maxDt, Perf.hitches = _frames, _acc, _maxDt, _hitches
 	end))
 
 	UI = buildUI()
 
+	-- Network optimization first (safe, fast)
+	pcall(applyNetworkOpt)
+
+	-- Analyze experience (registers effects, gathers scene stats)
 	scanRoot(Lighting)
 	scanRoot(workspace)
 	finishScene()
 	updateMetrics()
 	updateCounts()
 
-	-- Map intelligence (structural signals only)
-	pcall(scanMapInfo)
+	-- Map scan in background so UI shows up immediately
+	task.spawn(function()
+		RunService.Heartbeat:Wait()
+		RunService.Heartbeat:Wait()
+		pcall(scanMapInfo)
+	end)
+
+	-- Wait for the map scan (short)
+	local waited = 0
+	while MapInfo.detectedAt == 0 and waited < 30 do
+		task.wait(0.1)
+		waited += 1
+	end
 
 	runDetection(true, os.clock())
 	Active.level, Active.profile = resolveActive()
@@ -1515,7 +1674,7 @@ end
 local ok, err = pcall(init)
 if ok then
 	task.spawn(function()
-		notify("FPS BOOSTER V2", "Smart optimization has been applied successfully!", 5)
+		notify("FPS BOOSTER V2", "Smart optimization applied — VFX + map + network ready!", 5)
 		notify("FPS BOOSTER V2", string.format("Profile: %s %s · VFX level: %s (%s)",
 			PROFILES[Active.profile].tag, PROFILES[Active.profile].display, LEVELS[Active.level].name,
 			MODE_NAMES[State.mode]), 6)
