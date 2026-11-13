@@ -1,34 +1,23 @@
 --[[
-	ROBLOX ULTIMATE FPS BOOSTER V2 — SMART GAME AUTO OPTIMIZATION
-	+ MAP INTELLIGENCE + NETWORK DIAGNOSTICS + ANTI-STUTTER
+	ROBLOX FPS BOOSTER V3 — GRAPHICS PRESETS + SMART OPTIMIZATION
+	+ MAP INTELLIGENCE + NETWORK LAYER + ANTI-STUTTER
 
 	(LocalScript)
 
-	INSTALL (Roblox Studio)
-	  1. Explorer > StarterPlayer > StarterPlayerScripts
-	  2. Right-click StarterPlayerScripts > Insert Object > LocalScript
-	  3. Name it "FPSBoosterV2", paste this whole file, press Play.
-	  (If V1 is installed, V2 shuts it down automatically. Better: delete V1.)
+	INSTALL: StarterPlayer > StarterPlayerScripts > LocalScript > "FPSBoosterV3"
 
-	WHAT IT NEVER TOUCHES
-	  Render distance, camera distance, fog / Atmosphere, terrain, StreamingMinRadius,
-	  StreamingTargetRadius, RemoteEvents/Functions (except opt-in cache attribute), ForceField,
-	  Humanoids, hitboxes, damage or invulnerability logic, CameraType / CameraSubject.
+	GRAPHICS PRESETS
+	  1. ภาพมันฝรั่ง   (Potato)    — pixelated, effects ปิด, shadows ปิด
+	  2. ลื่นไหล       (Smooth)    — effects เบา, ไม่มี shadows
+	  3. ภาพปกติ       (Normal)    — สมดุล, effects ปกติ
+	  4. สวยปานกลาง    (Beautiful) — effects สวย, shadows เบา
+	  5. RTX + แสงเงา  (RTX)       — effects เต็ม, shadows ครบ
 
-	WHAT IT CAN DO FOR NETWORK
-	  • Physical ping (ISP → Roblox region) CANNOT be changed by a LocalScript.
-	  • This script reduces *perceived* lag:
-	      - Input priority buffer         (snappier feel)
-	      - Physics throttle              (server load ↓, ping can drop 5–15 ms)
-	      - Remote Function cache         (opt-in via attribute "FPSBoosterCacheable")
-	      - Ping EMA smoothing            (stable, readable UI)
-	      - Region hint + perceived-lag advisor
-
-	DEVELOPER HOOKS
-	  - Tag/attribute "FPSBoosterIgnore"        → effect never touched
-	  - Tag/attribute "FPSBoosterIFrameOverlay" → may be hidden by IFrame module
-	  - Attribute "FPSBoosterKeep" = true       → overlay never hidden
-	  - Attribute "FPSBoosterCacheable" = true  → RemoteFunction safe to cache
+	HOTKEYS
+	  F1 = Toggle Booster
+	  F2 = Screenshot mode (pause 3s)
+	  F3 = Cycle graphics preset
+	  F4 = Benchmark (10s)
 ]]
 
 --// Services ------------------------------------------------------------------------------
@@ -44,21 +33,26 @@ local CollectionService  = game:GetService("CollectionService")
 local Teams              = game:GetService("Teams")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local MarketplaceService = game:GetService("MarketplaceService")
+local Debris             = game:GetService("Debris")
 
 local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 --// Config ----------------------------------------------------------------------------------
 local CONFIG = {
-	GUI_NAME             = "FPSBoosterV2UI",
+	GUI_NAME             = "FPSBoosterV3UI",
 	IGNORE_TAG           = "FPSBoosterIgnore",
 	IFRAME_TAG           = "FPSBoosterIFrameOverlay",
 	KEEP_ATTRIBUTE       = "FPSBoosterKeep",
 	CACHE_ATTRIBUTE      = "FPSBoosterCacheable",
-	IFRAME_OVERLAY_NAMES = {},
 	REPEAT_MIN           = 12,
-	MAP_SCAN_INTERVAL    = 40,   -- ticks (0.5s each) => ~20s
-	PASS_BUDGET_MS       = 4,    -- ms per Heartbeat for runPass
+	MAP_SCAN_INTERVAL    = 40,
+	PASS_BUDGET_MS       = 6,
+	BATCH_SIZE           = 400,
+	HOTKEYS_ENABLED      = true,
+	SCREENSHOT_PAUSE     = 3,
+	BENCHMARK_DURATION   = 10,
+	AUTO_LOW_FPS         = 25,
 	SCAN_CAPS = {
 		RemoteStorage = 120,
 		RoundPattern  = 500,
@@ -67,26 +61,25 @@ local CONFIG = {
 	},
 }
 
---// Singleton guard -------------------------------------------------------------------------
+--// Singleton -------------------------------------------------------------------------------
 do
 	local previous = _G.__FPSBooster
 	if type(previous) == "table" and type(previous.Destroy) == "function" then
 		pcall(previous.Destroy)
 	end
-	for _, n in ipairs({ CONFIG.GUI_NAME, "FPSBoosterUI" }) do
+	for _, n in ipairs({ CONFIG.GUI_NAME, "FPSBoosterV2UI", "FPSBoosterUI" }) do
 		local stale = playerGui:FindFirstChild(n)
 		if stale then stale:Destroy() end
 	end
 end
 
---// Lifecycle ---------------------------------------------------------------------------------
 local running = true
 local ready = false
 local conns = {}
 local startTime = os.clock()
 local function track(conn) conns[#conns + 1] = conn return conn end
 
---// Device -------------------------------------------------------------------------------------
+--// Device ---------------------------------------------------------------------------------
 local platformName, isMobile = "PC", false
 do
 	local ok, p = pcall(function() return UserInputService:GetPlatform() end)
@@ -98,15 +91,16 @@ do
 	end
 end
 
---// Theme ---------------------------------------------------------------------------------------
+--// Theme ----------------------------------------------------------------------------------
 local C = {
 	bg = Color3.fromRGB(12, 14, 20), panel = Color3.fromRGB(21, 25, 35), chip = Color3.fromRGB(32, 38, 52),
 	off = Color3.fromRGB(52, 60, 78), green = Color3.fromRGB(0, 255, 136), blue = Color3.fromRGB(0, 170, 255),
 	text = Color3.fromRGB(232, 240, 255), dim = Color3.fromRGB(130, 146, 168),
 	yellow = Color3.fromRGB(255, 200, 60), red = Color3.fromRGB(255, 77, 96), dark = Color3.fromRGB(8, 10, 14),
+	purple = Color3.fromRGB(180, 130, 255), orange = Color3.fromRGB(255, 140, 60),
 }
 
---// Helpers ---------------------------------------------------------------------------------------
+--// Helpers --------------------------------------------------------------------------------
 local function make(className, props, parent)
 	local o = Instance.new(className)
 	for k, v in pairs(props) do o[k] = v end
@@ -154,25 +148,54 @@ local function scaleFloor(orig, mult, floorValue)
 end
 
 local function notify(title, text, duration)
-	for _ = 1, 10 do
+	for _ = 1, 8 do
 		local ok = pcall(function()
 			StarterGui:SetCore("SendNotification", { Title = title, Text = text, Duration = duration or 5 })
 		end)
 		if ok then return true end
-		task.wait(0.5)
+		task.wait(0.4)
 	end
 	return false
 end
 
 --==================================================================================================
--- 1) DATA: levels, profiles, modes
+-- 1) GRAPHICS PRESETS (replaces old LEVELS)
 --==================================================================================================
-local LEVELS = {
-	{ name = "Low",    rate = 0.75, life = 0.95, size = 1.00, trail = 0.85, beam = 0.85, post = 0.85, cc = 0.97, lightShadows = false },
-	{ name = "Medium", rate = 0.55, life = 0.90, size = 0.95, trail = 0.70, beam = 0.70, post = 0.70, cc = 0.93, lightShadows = false },
-	{ name = "High",   rate = 0.35, life = 0.80, size = 0.90, trail = 0.55, beam = 0.55, post = 0.55, cc = 0.88, lightShadows = true  },
-	{ name = "Ultra",  rate = 0.20, life = 0.65, size = 0.80, trail = 0.40, beam = 0.40, post = 0.40, cc = 0.80, lightShadows = true  },
+-- Each preset defines multipliers (1 = keep original, 0.x = reduce).
+-- "special" flags control extra behaviors (pixelation, shadows, etc.)
+local PRESETS = {
+	{
+		id = "Potato", name = "ภาพมันฝรั่ง", icon = "🥔", color = C.red,
+		desc = "Pixelated, no effects, no shadows",
+		rate = 0.10, life = 0.50, size = 0.60, trail = 0.15, beam = 0.25, post = 0.15, cc = 0.50,
+		lightShadows = false, pixelation = true, noPost = true, lowTerrain = true,
+	},
+	{
+		id = "Smooth", name = "ลื่นไหล", icon = "⚡", color = C.green,
+		desc = "Light effects, no shadows, high FPS",
+		rate = 0.35, life = 0.75, size = 0.85, trail = 0.40, beam = 0.45, post = 0.40, cc = 0.75,
+		lightShadows = false, pixelation = false, noPost = false, lowTerrain = false,
+	},
+	{
+		id = "Normal", name = "ภาพปกติ", icon = "⚖️", color = C.blue,
+		desc = "Balanced visuals and performance",
+		rate = 0.60, life = 0.90, size = 0.95, trail = 0.70, beam = 0.70, post = 0.70, cc = 0.92,
+		lightShadows = false, pixelation = false, noPost = false, lowTerrain = false,
+	},
+	{
+		id = "Beautiful", name = "สวยปานกลาง", icon = "💎", color = C.purple,
+		desc = "Nice effects, soft shadows",
+		rate = 0.85, life = 0.95, size = 1.00, trail = 0.90, beam = 0.90, post = 0.90, cc = 0.98,
+		lightShadows = true, pixelation = false, noPost = false, lowTerrain = false,
+	},
+	{
+		id = "RTX", name = "RTX + แสงเงา", icon = "✨", color = C.yellow,
+		desc = "Full effects, all shadows, max quality",
+		rate = 1.00, life = 1.00, size = 1.00, trail = 1.00, beam = 1.00, post = 1.00, cc = 1.00,
+		lightShadows = true, pixelation = false, noPost = false, lowTerrain = false,
+	},
 }
+local PRESET_INDEX = { Potato = 1, Smooth = 2, Normal = 3, Beautiful = 4, RTX = 5 }
 
 local PROFILES = {
 	Combat    = { tag = "A", display = "Combat / Fighting", bias = 0, repeatS = 1.3, trailS = 1.0,
@@ -189,11 +212,8 @@ local PROFILES = {
 		s = { ambient = 1.0, other = 1.0, own = 0.8, object = 0.7, post = 1.0 } },
 }
 local PROFILE_CHOICES = { "Auto", "Combat", "Sports", "OpenWorld", "Simulator", "HeavyVFX", "General" }
-local MODES = { "Auto", "Ultra", "Balanced", "Visual", "Custom" }
-local MODE_NAMES = {
-	Auto = "Auto (adaptive)", Ultra = "Ultra Performance", Balanced = "Balanced",
-	Visual = "Visual Quality", Custom = "Custom (manual)",
-}
+local MODES = { "Auto", "Manual" }
+local MODE_NAMES = { Auto = "Auto (adaptive)", Manual = "Manual (fixed preset)" }
 
 local POST_CLASSES = {
 	BloomEffect = true, BlurEffect = true, SunRaysEffect = true,
@@ -207,13 +227,23 @@ local PART_CLASSES = {
 --==================================================================================================
 -- 2) STATE
 --==================================================================================================
-local State  = { enabled = true, mode = "Auto", customLevel = 2, profileChoice = "Auto" }
-local Active = { level = 1, profile = "General" }
-local Detect = { profile = "General", reason = "Analyzing…", workload = "Unknown", pending = nil, pendingCount = 0,
-                 lastChange = 0, scores = {} }
-local Auto   = { level = 1, low = 0, high = 0, lowSecs = 0, lastChange = 0, lastDown = nil, floorLevel = 1,
-                 floorUntil = 0, noRaiseUntil = 0, peak = 0, pending = nil, bottleneck = "Measuring…" }
-local Perf   = { fps = 0, frameMs = 0, worstMs = 0, frames = 0, acc = 0, maxDt = 0, hitches = 0, hitchShown = 0, memMb = nil }
+local State  = {
+	enabled = true,
+	mode = "Auto",
+	presetId = "Normal",
+	profileChoice = "Auto",
+	autoQuality = true,
+	screenshotMode = false,
+	benchmarking = false,
+}
+local Active = { presetId = "Normal", presetIdx = 3, profile = "General" }
+local Detect = { profile = "General", reason = "Analyzing…", workload = "Unknown",
+                 pending = nil, pendingCount = 0, lastChange = 0, scores = {} }
+local Auto   = { presetIdx = 3, low = 0, high = 0, lowSecs = 0, lastChange = 0, lastDown = nil,
+                 floorIdx = 1, floorUntil = 0, noRaiseUntil = 0, peak = 0, pending = nil,
+                 bottleneck = "Measuring…" }
+local Perf   = { fps = 0, frameMs = 0, worstMs = 0, frames = 0, acc = 0, maxDt = 0, hitches = 0,
+                 hitchShown = 0, memMb = nil }
 local Net    = { samples = {}, ping = nil, source = "", jitter = 0, peak = 0, mean = 0, status = "Unavailable",
                  trend = "steady", recv = nil, send = nil }
 local Scene  = { parts = 0, humanoids = 0, balls = 0, preserved = 0, extent = 0, terrainSpan = 0,
@@ -221,9 +251,12 @@ local Scene  = { parts = 0, humanoids = 0, balls = 0, preserved = 0, extent = 0,
 local Metrics = { emitters = 0, active = 0, rateSum = 0, trails = 0, beams = 0, post = 0, lights = 0, smokeFire = 0,
                   charFx = 0, objectFx = 0, ambientFx = 0, tracked = 0, maxRep = 0, repRatio = 0, tools = 0,
                   physRate = 60, cachedRemotes = 0 }
-local Counts = { tracked = 0, adjusted = 0 }
+local Counts = { tracked = 0, adjusted = 0, scanned = 0 }
 local IFrame = { enabled = false, conns = {} }
 local StatusText = "Initializing…"
+
+local Bench = { running = false, startTime = 0, samples = {}, avg = 0, min = math.huge, max = 0,
+                minFps = math.huge, maxFps = 0, result = nil }
 
 local MapInfo = {
 	placeId = game.PlaceId, placeName = "", creatorName = "", creatorId = 0,
@@ -235,30 +268,44 @@ local MapInfo = {
 }
 
 local UI = nil
-local refresh, reapplyAll, setEnabled, setMode, cycleProfile, setCustomLevel, setIFrame, restoreAll, closeAll
+local refresh, reapplyAll, setEnabled, setMode, setPreset, cyclePreset, cycleProfile,
+      setAutoQuality, setIFrame, restoreAll, closeAll, runBenchmark, toggleScreenshotMode
+      = nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
 
 --==================================================================================================
--- 3) VFX ENGINE (save → modify → restore)
+-- 3) VFX ENGINE — Fast batch processing + dirty tracking
 --==================================================================================================
 local records  = setmetatable({}, { __mode = "k" })
 local tracked  = setmetatable({}, { __mode = "k" })
 local metaOf   = setmetatable({}, { __mode = "k" })
 local overlays = setmetatable({}, { __mode = "k" })
 local NameCount = {}
+local trackedList = {}  -- flat array for iteration (cache)
+
+-- Cache current preset values (avoid table lookups)
+local CUR = { rate = 1, life = 1, size = 1, trail = 1, beam = 1, post = 1, cc = 1,
+              lightShadows = false, pixelation = false, noPost = false, lowTerrain = false }
+
+local function updateCur()
+	local p = PRESETS[Active.presetIdx]
+	CUR.rate = p.rate; CUR.life = p.life; CUR.size = p.size; CUR.trail = p.trail
+	CUR.beam = p.beam; CUR.post = p.post; CUR.cc = p.cc
+	CUR.lightShadows = p.lightShadows; CUR.pixelation = p.pixelation
+	CUR.noPost = p.noPost; CUR.lowTerrain = p.lowTerrain
+end
 
 local curCat, curRep = "ambient", false
 
 local function M(kind, minM)
-	local lvl = LEVELS[Active.level]
 	local prof = PROFILES[Active.profile]
 	local s = prof.s[curCat] or 1
 	if curRep then s *= prof.repeatS end
 	if kind == "trail" then s *= prof.trailS end
-	return math.clamp(1 - (1 - lvl[kind]) * s, minM or 0.1, 1)
+	return math.clamp(1 - (1 - CUR[kind]) * s, minM or 0.1, 1)
 end
 
 local function lightShadowsOff()
-	return LEVELS[Active.level].lightShadows and PROFILES[Active.profile].s[curCat] ~= 0
+	return CUR.lightShadows and PROFILES[Active.profile].s[curCat] ~= 0
 end
 
 local lightHandler = { { "Shadows", function(o) if lightShadowsOff() then return false end return o end } }
@@ -370,6 +417,7 @@ local function register(inst)
 	if isIgnored(inst) then return end
 	local cn = inst.ClassName
 	tracked[inst] = true
+	trackedList[#trackedList + 1] = inst
 	metaOf[inst] = { cat = POST_CLASSES[cn] and "post" or classifyWorld(inst) }
 	if cn == "ParticleEmitter" then NameCount[inst.Name] = (NameCount[inst.Name] or 0) + 1 end
 end
@@ -377,7 +425,7 @@ end
 local function processInstance(inst)
 	local handlers = HANDLERS[inst.ClassName]
 	if not handlers then return end
-	local enabled = State.enabled
+	local enabled = State.enabled and not State.screenshotMode
 	local rec = records[inst]
 	if not enabled and not rec then return end
 
@@ -396,11 +444,8 @@ local function processInstance(inst)
 end
 
 --==================================================================================================
--- 4) IFRAME MODULE (optional, OFF by default)
+-- 4) IFRAME MODULE
 --==================================================================================================
-local approvedNames = {}
-for _, n in ipairs(CONFIG.IFRAME_OVERLAY_NAMES) do approvedNames[n] = true end
-
 local function overlayProp(inst)
 	if inst:IsA("GuiObject") then return "Visible" end
 	if inst:IsA("LayerCollector") or inst:IsA("Highlight") then return "Enabled" end
@@ -413,7 +458,6 @@ local function isApprovedOverlay(inst)
 	if UI and UI.gui and inst:IsDescendantOf(UI.gui) then return false end
 	local explicit = CollectionService:HasTag(inst, CONFIG.IFRAME_TAG)
 		or inst:GetAttribute(CONFIG.IFRAME_TAG) == true
-		or approvedNames[inst.Name] == true
 	if not explicit then return false end
 	if inst:IsA("GuiButton") or inst:IsA("TextBox") then return false end
 	if inst:IsA("GuiBase2d") and (inst:FindFirstChildWhichIsA("GuiButton", true) or inst:FindFirstChildWhichIsA("TextBox", true)) then
@@ -426,7 +470,7 @@ local function returnFalse() return false end
 local function processOverlay(inst)
 	local prop = overlayProp(inst)
 	if not prop then return end
-	local hide = State.enabled and IFrame.enabled
+	local hide = State.enabled and IFrame.enabled and not State.screenshotMode
 	local rec = records[inst]
 	if not hide and not rec then return end
 	if not rec then rec = {}; records[inst] = rec end
@@ -442,16 +486,6 @@ local function registerOverlay(inst)
 	end
 end
 
-local function overlayScan()
-	for _, inst in ipairs(CollectionService:GetTagged(CONFIG.IFRAME_TAG)) do pcall(registerOverlay, inst) end
-	local n = 0
-	for _, d in ipairs(playerGui:GetDescendants()) do
-		if d:GetAttribute(CONFIG.IFRAME_TAG) == true or approvedNames[d.Name] then pcall(registerOverlay, d) end
-		n += 1
-		if n % 500 == 0 then task.wait() end
-	end
-end
-
 setIFrame = function(v)
 	v = v and true or false
 	if v == IFrame.enabled then return end
@@ -460,14 +494,15 @@ setIFrame = function(v)
 	table.clear(IFrame.conns)
 	if v then
 		IFrame.conns[1] = playerGui.DescendantAdded:Connect(function(inst)
-			if inst:GetAttribute(CONFIG.IFRAME_TAG) == true or approvedNames[inst.Name] then
+			if inst:GetAttribute(CONFIG.IFRAME_TAG) == true then
 				task.defer(registerOverlay, inst)
 			end
 		end)
-		IFrame.conns[2] = CollectionService:GetInstanceAddedSignal(CONFIG.IFRAME_TAG):Connect(function(inst)
-			task.defer(registerOverlay, inst)
+		task.spawn(function()
+			for _, d in ipairs(playerGui:GetDescendants()) do
+				if d:GetAttribute(CONFIG.IFRAME_TAG) == true then pcall(registerOverlay, d) end
+			end
 		end)
-		task.spawn(overlayScan)
 	else
 		for inst in pairs(overlays) do pcall(processOverlay, inst) end
 		table.clear(overlays)
@@ -476,7 +511,7 @@ setIFrame = function(v)
 end
 
 --==================================================================================================
--- 5) APPLY PASSES (anti-stutter: budget-based)
+-- 5) APPLY PASSES — frame-budgeted with adaptive chunk
 --==================================================================================================
 local generation = 0
 local function processAny(inst)
@@ -484,19 +519,29 @@ local function processAny(inst)
 end
 
 local function runPass(gen)
-	local list = {}
-	for inst in pairs(tracked) do list[#list + 1] = inst end
-	for inst in pairs(overlays) do list[#list + 1] = inst end
-	local n, i = #list, 1
+	updateCur()
+	local n = #trackedList
+	local i = 1
 	local budget = CONFIG.PASS_BUDGET_MS / 1000
+	local chunkLimit = 2000
+
 	while i <= n do
 		if gen ~= generation or not running then return false end
 		local frameStart = os.clock()
-		while i <= n and (os.clock() - frameStart) < budget do
-			pcall(processAny, list[i])
+		local processed = 0
+		while i <= n and (os.clock() - frameStart) < budget and processed < chunkLimit do
+			local inst = trackedList[i]
+			pcall(processAny, inst)
 			i += 1
+			processed += 1
 		end
 		if i <= n then RunService.Heartbeat:Wait() end
+	end
+
+	-- process overlays too
+	for inst in pairs(overlays) do
+		if gen ~= generation or not running then return false end
+		pcall(processOverlay, inst)
 	end
 	return true
 end
@@ -571,7 +616,8 @@ local function updateMetrics()
 		charFx = 0, objectFx = 0, ambientFx = 0, tracked = 0, maxRep = 0, repRatio = 0, tools = 0,
 		physRate = 60, cachedRemotes = 0 }
 	local names = {}
-	for inst in pairs(tracked) do
+	for i = 1, #trackedList do
+		local inst = trackedList[i]
 		local cn = inst.ClassName
 		m.tracked += 1
 		local meta = metaOf[inst]
@@ -630,11 +676,7 @@ local function getProductInfoCached()
 	if _productCache then return _productCache end
 	local ok, product = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
 	if ok and product then
-		_productCache = {
-			name      = product.Name or "",
-			creator   = product.Creator and product.Creator.Name or "",
-			creatorId = product.Creator and product.Creator.CreatorTargetId or 0,
-		}
+		_productCache = { name = product.Name or "", creator = "", creatorId = 0 }
 	else
 		_productCache = { name = "", creator = "", creatorId = 0 }
 	end
@@ -646,9 +688,7 @@ local function scanMapInfo()
 	info.detectedAt = os.clock()
 
 	local prod = getProductInfoCached()
-	info.placeName   = prod.name
-	info.creatorName = prod.creator
-	info.creatorId   = prod.creatorId
+	info.placeName = prod.name
 	if info.placeName == "" then
 		pcall(function()
 			info.creatorName = game.CreatorName or ""
@@ -675,9 +715,7 @@ local function scanMapInfo()
 		for _, d in ipairs(playerGui:GetDescendants()) do
 			if not shopGuiHit then
 				local nm = d.Name:lower()
-				if nm:find("shop", 1, true) or nm:find("store", 1, true) or nm:find("buy", 1, true) then
-					shopGuiHit = true
-				end
+				if nm:find("shop") or nm:find("store") or nm:find("buy") then shopGuiHit = true end
 			end
 			n += 1
 			if n >= CONFIG.SCAN_CAPS.ShopGui then break end
@@ -689,7 +727,7 @@ local function scanMapInfo()
 		for _, d in ipairs(player.Backpack:GetChildren()) do
 			if not shopBpHit then
 				local nm = d.Name:lower()
-				if nm:find("shop", 1, true) or nm:find("buy", 1, true) then shopBpHit = true end
+				if nm:find("shop") or nm:find("buy") then shopBpHit = true end
 			end
 			n += 1
 			if n >= CONFIG.SCAN_CAPS.ShopBackpack then break end
@@ -705,17 +743,14 @@ local function scanMapInfo()
 			end
 			if not roundHit then
 				local nm = d.Name:lower()
-				if nm:find("round", 1, true) or nm:find("gamestate", 1, true)
-					or nm:find("matchstate", 1, true) or nm:find("match", 1, true) then
-					roundHit = true
-				end
+				if nm:find("round") or nm:find("gamestate") or nm:find("match") then roundHit = true end
 			end
 			n += 1
 			if n >= CONFIG.SCAN_CAPS.RoundPattern then break end
 		end
 	end)
 
-	info.hasShop     = shopGuiHit or shopBpHit
+	info.hasShop = shopGuiHit or shopBpHit
 	info.remoteCount = remoteCount
 	info.hasRoundSys = roundHit
 
@@ -825,37 +860,25 @@ end
 --==================================================================================================
 -- 7.5) NETWORK OPTIMIZATION LAYER
 --==================================================================================================
--- ⚠️ Physical ping (ISP → Roblox region) CANNOT be changed by a LocalScript.
--- This layer reduces perceived lag & server load:
---   • Physics throttle    → less server physics work (real ping ↓ 5–15 ms if server loaded)
---   • Remote Function cache (opt-in) → fewer round-trips
---   • Ping EMA smoothing → stable UI, no fake numbers
---   • Region hint + perceived-lag advisor → inform user
-
 local NetOpt = {
-	enabled         = true,
-	physicsThrottle = true,
-	remoteCache     = true,
-	region          = "Unknown",
-	physRate        = 60,
-	cachedRemotes   = 0,
-	remoteConns     = {},
-	restoredPhys    = nil,
+	enabled = true, physicsThrottle = true,
+	region = "Unknown", physRate = 60, restoredPhys = nil,
 }
 
-local SAFE_REMOTE_PATTERN   = { "get", "fetch", "info", "data", "stats", "profile" }
-local UNSAFE_REMOTE_PATTERN = { "buy", "purchase", "sell", "attack", "damage",
-	"claim", "spend", "trade", "use", "equip", "fire", "cast", "activate", "submit", "set", "update" }
+local function detectRegion()
+	local ok, regionId = pcall(function() return workspace:GetAttribute("Region") end)
+	if ok and type(regionId) == "string" and #regionId >= 2 then return regionId end
+	return "Unknown"
+end
 
-local function isSafeToCache(name)
-	local n = name:lower()
-	for _, p in ipairs(UNSAFE_REMOTE_PATTERN) do
-		if n:find(p, 1, true) then return false end
-	end
-	for _, p in ipairs(SAFE_REMOTE_PATTERN) do
-		if n:find(p, 1, true) then return true end
-	end
-	return false
+local function setupPhysicsThrottle()
+	if not NetOpt.physicsThrottle then return end
+	pcall(function()
+		NetOpt.restoredPhys = workspace.PhysicsSteppingMethod
+		if workspace.PhysicsSteppingMethod ~= Enum.PhysicsSteppingMethod.Fixed then
+			workspace.PhysicsSteppingMethod = Enum.PhysicsSteppingMethod.Fixed
+		end
+	end)
 end
 
 local pingEMA = 0
@@ -865,52 +888,7 @@ local function smoothPing()
 	return pingEMA
 end
 
-local function detectRegion()
-	local ok, regionId = pcall(function()
-		return workspace:GetAttribute("Region")
-	end)
-	if ok and type(regionId) == "string" and #regionId >= 2 then
-		return regionId
-	end
-	return "Unknown"
-end
-
-local function setupPhysicsThrottle()
-	if not NetOpt.physicsThrottle then return end
-	pcall(function()
-		-- remember original so we can restore
-		NetOpt.restoredPhys = workspace.PhysicsSteppingMethod
-		if workspace.PhysicsSteppingMethod ~= Enum.PhysicsSteppingMethod.Fixed then
-			workspace.PhysicsSteppingMethod = Enum.PhysicsSteppingMethod.Fixed
-		end
-	end)
-end
-
-local function setupRemoteCache()
-	if not NetOpt.remoteCache then return end
-	local function markCacheable(rf)
-		if not rf:IsA("RemoteFunction") then return end
-		if rf:GetAttribute(CONFIG.CACHE_ATTRIBUTE) ~= true then return end
-		-- We do NOT override metatable or wrap InvokeServer.
-		-- We only track the developer's explicit opt-in so we can report it
-		-- and, if a Roblox API ever exposes caching hooks, use it.
-		NetOpt.cachedRemotes += 1
-	end
-	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-		pcall(markCacheable, d)
-	end
-	NetOpt.remoteConns[1] = ReplicatedStorage.DescendantAdded:Connect(function(d)
-		if d:IsA("RemoteFunction") then task.defer(markCacheable, d) end
-	end)
-end
-
-local NetDiag = {
-	serverRTT  = 0,
-	clientLoad = 0,
-	netHealth  = "Unknown",
-	advice     = "",
-	perceived  = 0,
-}
+local NetDiag = { serverRTT = 0, clientLoad = 0, netHealth = "Unknown", advice = "", perceived = 0 }
 
 local function runNetworkDiagnostics()
 	NetDiag.serverRTT  = smoothPing() or 0
@@ -918,17 +896,13 @@ local function runNetworkDiagnostics()
 	local perceived = NetDiag.serverRTT + NetDiag.clientLoad * 1.5
 	NetDiag.perceived = perceived
 	if perceived < 80 then
-		NetDiag.netHealth = "Excellent"
-		NetDiag.advice = "Connection is optimal."
+		NetDiag.netHealth = "Excellent"; NetDiag.advice = "Connection is optimal."
 	elseif perceived < 150 then
-		NetDiag.netHealth = "Good"
-		NetDiag.advice = "Smooth — no action needed."
+		NetDiag.netHealth = "Good"; NetDiag.advice = "Smooth — no action needed."
 	elseif perceived < 250 then
-		NetDiag.netHealth = "Fair"
-		NetDiag.advice = "Try lower VFX level or a closer server region."
+		NetDiag.netHealth = "Fair"; NetDiag.advice = "Try lower preset or closer region."
 	else
-		NetDiag.netHealth = "Poor"
-		NetDiag.advice = "Check Wi-Fi; try a server in your region."
+		NetDiag.netHealth = "Poor"; NetDiag.advice = "Check Wi-Fi; try a closer server."
 	end
 end
 
@@ -936,12 +910,9 @@ local function applyNetworkOpt()
 	if not NetOpt.enabled then return end
 	NetOpt.region = detectRegion()
 	pcall(setupPhysicsThrottle)
-	pcall(setupRemoteCache)
 end
 
 local function restoreNetworkOpt()
-	for _, c in ipairs(NetOpt.remoteConns) do pcall(function() c:Disconnect() end) end
-	table.clear(NetOpt.remoteConns)
 	pcall(function()
 		if NetOpt.restoredPhys ~= nil then
 			workspace.PhysicsSteppingMethod = NetOpt.restoredPhys
@@ -950,7 +921,7 @@ local function restoreNetworkOpt()
 end
 
 --==================================================================================================
--- 8) SMART PROFILE DETECTION (VFX + MAP SIGNALS)
+-- 8) SMART PROFILE DETECTION
 --==================================================================================================
 local function evaluateProfile()
 	local m, sc, mi = Metrics, Scene, MapInfo
@@ -964,39 +935,29 @@ local function evaluateProfile()
 	if fxTotal >= 8 and charRatio >= 0.35 then add("Combat", 3, string.format("%d%% of effects attach to characters", math.floor(charRatio * 100))) end
 	if m.tools >= 2 then add("Combat", 2, string.format("%d tools equipped/owned", m.tools)) end
 	if sc.humanoids >= 4 then add("Combat", 1, string.format("%d characters/NPCs present", sc.humanoids)) end
-
 	if sc.balls >= 1 and sc.balls <= 4 then add("Sports", 3, string.format("%d ball-shaped moving object(s)", sc.balls)) end
 	if m.objectFx >= 1 and sc.balls >= 1 then add("Sports", 1, "effects attached to moving objects") end
 	if sc.humanoids >= 6 and sc.balls >= 1 then add("Sports", 1, "many players around a ball") end
-
 	if sc.extent >= 2500 then add("OpenWorld", 3, string.format("world spans ~%d studs", math.floor(sc.extent))) end
 	if workspace.StreamingEnabled then add("OpenWorld", 2, "StreamingEnabled is on") end
 	if sc.terrainSpan >= 200 then add("OpenWorld", 2, "large terrain area") end
 	if sc.parts >= 20000 then add("OpenWorld", 1, string.format("%d parts loaded", sc.parts)) end
-
-	if m.maxRep >= 15 and m.repRatio >= 0.4 then
-		add("Simulator", 3, string.format("%d identical emitters repeated (%d%% of all)", m.maxRep, math.floor(m.repRatio * 100)))
-	end
+	if m.maxRep >= 15 and m.repRatio >= 0.4 then add("Simulator", 3, string.format("%d identical emitters", m.maxRep)) end
 	if player:FindFirstChild("leaderstats") then add("Simulator", 1, "leaderstats present") end
 	if m.ambientFx >= 40 then add("Simulator", 1, string.format("%d world-placed effects", m.ambientFx)) end
-
 	if m.active >= 250 then add("HeavyVFX", 3, string.format("%d active emitters", m.active))
 	elseif m.active >= 120 then add("HeavyVFX", 2, string.format("%d active emitters", m.active)) end
-	if m.rateSum >= 4000 then add("HeavyVFX", 3, string.format("%dk particles/s requested", math.floor(m.rateSum / 1000)))
-	elseif m.rateSum >= 1500 then add("HeavyVFX", 2, string.format("%.1fk particles/s requested", m.rateSum / 1000)) end
+	if m.rateSum >= 4000 then add("HeavyVFX", 3, string.format("%dk particles/s", math.floor(m.rateSum / 1000)))
+	elseif m.rateSum >= 1500 then add("HeavyVFX", 2, string.format("%.1fk particles/s", m.rateSum / 1000)) end
 	if m.post >= 4 then add("HeavyVFX", 1, string.format("%d lighting effects", m.post)) end
-	if m.trails + m.beams >= 100 then add("HeavyVFX", 1, string.format("%d trails/beams", m.trails + m.beams)) end
-	if Auto.lowSecs >= 10 and fxTotal >= 60 then add("HeavyVFX", 2, "FPS below target while many effects are active") end
+	if Auto.lowSecs >= 10 and fxTotal >= 60 then add("HeavyVFX", 2, "FPS below target while many effects active") end
 
-	-- Map structure priors
-	if mi.hasTeams and mi.teamCount >= 2 then add("Combat", 2, string.format("%d teams detected", mi.teamCount)) end
-	if mi.hasRoundSys then add("Combat", 1, "round/game-state system found") end
-	if mi.signature == "RoundBased" and mi.confidence >= 60 then add("Combat", 2, "round-based experience") end
-	if mi.signature == "SportsSimulator" then add("Sports", 2, "sports simulator signature") end
+	if mi.hasTeams and mi.teamCount >= 2 then add("Combat", 2, string.format("%d teams", mi.teamCount)) end
+	if mi.hasRoundSys then add("Combat", 1, "round system") end
+	if mi.signature == "SportsSimulator" then add("Sports", 2, "sports signature") end
 	if mi.hasTerrain and mi.terrainSize >= 1000 then add("OpenWorld", 2, string.format("terrain %.0f studs", mi.terrainSize)) end
-	if workspace.StreamingEnabled and mi.partCount >= 15000 then add("OpenWorld", 1, "large streamed world") end
 	if mi.hasLeaderstats and m.maxRep >= 10 then add("Simulator", 2, "leaderstats + repeated emitters") end
-	if mi.hasShop then add("Simulator", 1, "shop UI present") end
+	if mi.hasShop then add("Simulator", 1, "shop UI") end
 	if mi.remoteCount >= 20 and m.active >= 100 then add("HeavyVFX", 1, string.format("%d remotes + heavy FX", mi.remoteCount)) end
 
 	local best, bestScore = "General", 0
@@ -1010,7 +971,7 @@ local function evaluateProfile()
 	Detect.scores = scores
 	local reason
 	if best == "General" then
-		reason = "No strong genre signature, using balanced defaults"
+		reason = "No strong genre, using balanced defaults"
 	else
 		local parts = {}
 		for i = 1, math.min(3, #why[best]) do parts[i] = why[best][i] end
@@ -1019,27 +980,26 @@ local function evaluateProfile()
 			reason ..= " (also resembles " .. PROFILES[genre].display .. ")"
 		end
 	end
-	if sc.preserved > 0 then reason ..= string.format(" · %d protected indicators", sc.preserved) end
 	return best, reason
 end
 
-local function baselineLevel(profileKey)
-	local base = (isMobile and 2 or 1) + PROFILES[profileKey].bias
-	if MapInfo.partCount >= 20000 and workspace.StreamingEnabled then base += 1 end
-	if MapInfo.playerCount >= 8 then
-		base += 1
-	elseif MapInfo.playerCount >= 4 then
-		base += 0.5
-		base = math.floor(base + 0.5)
-	end
-	return math.clamp(base, 1, 4)
+-- Convert profile → suggested preset index
+local function suggestPreset(profileKey)
+	local prof = PROFILES[profileKey]
+	if profileKey == "HeavyVFX" then return 1 end  -- potato
+	if profileKey == "Combat" then return 2 end     -- smooth
+	if profileKey == "Sports" then return 2 end     -- smooth
+	if profileKey == "OpenWorld" then return isMobile and 1 or 3 end
+	if profileKey == "Simulator" then return 2 end
+	return isMobile and 2 or 3
 end
 
 local function runDetection(initial, now)
 	local best, reason = evaluateProfile()
 	if initial then
-		Detect.profile, Detect.reason, Detect.lastChange, Detect.pending, Detect.pendingCount = best, reason, now, nil, 0
-		Auto.level = baselineLevel(best)
+		Detect.profile, Detect.reason, Detect.lastChange = best, reason, now
+		Detect.pending, Detect.pendingCount = nil, 0
+		Auto.presetIdx = suggestPreset(best)
 		return true
 	end
 	if best == Detect.profile then
@@ -1048,44 +1008,56 @@ local function runDetection(initial, now)
 	end
 	if Detect.pending == best then Detect.pendingCount += 1 else Detect.pending, Detect.pendingCount = best, 1 end
 	if Detect.pendingCount >= 3 and now - Detect.lastChange >= 60 then
-		Detect.profile, Detect.reason, Detect.lastChange, Detect.pending, Detect.pendingCount = best, reason, now, nil, 0
-		Auto.level = math.max(Auto.level, baselineLevel(best))
+		Detect.profile, Detect.reason, Detect.lastChange = best, reason, now
+		Detect.pending, Detect.pendingCount = nil, 0
+		Auto.presetIdx = math.max(Auto.presetIdx, suggestPreset(best) - 1)
 		return true
 	end
 	return false
 end
 
 --==================================================================================================
--- 9) ADAPTIVE SETTINGS ENGINE
+-- 9) ADAPTIVE ENGINE
 --==================================================================================================
 local function resolveActive()
-	local profile = Detect.profile
-	local level
-	if State.mode == "Auto" then level = Auto.level
-	elseif State.mode == "Ultra" then level = 4
-	elseif State.mode == "Balanced" then level = 2
-	elseif State.mode == "Visual" then level = 1
-	else
-		level = State.customLevel
-		if State.profileChoice ~= "Auto" then profile = State.profileChoice end
+	local presetId = State.presetId
+	local presetIdx = PRESET_INDEX[presetId] or 3
+	if State.mode == "Auto" then
+		presetIdx = Auto.presetIdx
+		presetId = PRESETS[presetIdx].id
 	end
-	return math.clamp(level, 1, 4), profile
+	local profile = Detect.profile
+	if State.profileChoice ~= "Auto" then profile = State.profileChoice end
+	return presetId, presetIdx, profile
 end
 
 refresh = function(forceReapply)
-	local lvl, prof = resolveActive()
-	local changed = lvl ~= Active.level or prof ~= Active.profile
-	Active.level, Active.profile = lvl, prof
+	local presetId, presetIdx, prof = resolveActive()
+	local changed = presetId ~= Active.presetId or prof ~= Active.profile
+	Active.presetId, Active.presetIdx, Active.profile = presetId, presetIdx, prof
+	updateCur()
 	if UI then UI.syncControls(false) end
 	if changed or forceReapply then reapplyAll() end
 end
 
-local function setAutoLevel(level, now)
-	Auto.level, Auto.lastChange, Auto.low, Auto.high = level, now, 0, 0
+local function setAutoPreset(idx, now)
+	Auto.presetIdx = idx
+	Auto.lastChange, Auto.low, Auto.high = now, 0, 0
 	refresh()
 end
 
 local function autoStep(now)
+	-- Auto quality (independent of Auto mode) — drop preset if FPS too low
+	if State.autoQuality and State.enabled and not State.screenshotMode then
+		if Perf.fps > 5 and Perf.fps < CONFIG.AUTO_LOW_FPS and Active.presetIdx > 1 then
+			if now - Auto.lastChange > 15 then
+				Auto.bottleneck = "Auto-quality: FPS low, dropping preset"
+				setAutoPreset(Active.presetIdx - 1, now)
+				return
+			end
+		end
+	end
+
 	if State.mode ~= "Auto" or not State.enabled then
 		Auto.low, Auto.high, Auto.pending = 0, 0, nil
 		return
@@ -1098,8 +1070,8 @@ local function autoStep(now)
 		Auto.pending = nil
 		if Perf.fps < p.fpsBefore * 1.04 and Perf.fps < target * 0.93 then
 			Auto.noRaiseUntil = now + 120
-			Auto.bottleneck = "Not VFX-bound (CPU, scripts or physics suspected)"
-			setAutoLevel(p.from, now)
+			Auto.bottleneck = "Not VFX-bound (CPU, scripts or physics)"
+			setAutoPreset(p.from, now)
 			return
 		end
 		Auto.bottleneck = "Render/VFX-bound (reduction helped)"
@@ -1111,23 +1083,79 @@ local function autoStep(now)
 
 	if now - Auto.lastChange < 8 then return end
 
-	if Auto.low >= 3 and Active.level < 4 and now >= Auto.noRaiseUntil then
+	if Auto.low >= 3 and Active.presetIdx > 1 and now >= Auto.noRaiseUntil then
 		if Auto.lastDown and now - Auto.lastDown < 90 then
-			Auto.floorLevel, Auto.floorUntil = Active.level + 1, now + 180
+			Auto.floorIdx, Auto.floorUntil = Active.presetIdx - 1, now + 180
 		end
-		Auto.pending = { from = Active.level, fpsBefore = Perf.fps, at = now }
-		setAutoLevel(Active.level + 1, now)
-	elseif Auto.high >= 15 and Active.level > 1 then
-		local floor = (now < Auto.floorUntil) and Auto.floorLevel or 1
-		if Active.level - 1 >= floor then
+		Auto.pending = { from = Active.presetIdx, fpsBefore = Perf.fps, at = now }
+		setAutoPreset(Active.presetIdx - 1, now)
+	elseif Auto.high >= 15 and Active.presetIdx < 5 then
+		local floor = (now < Auto.floorUntil) and Auto.floorIdx or 1
+		if Active.presetIdx + 1 <= 5 and Active.presetIdx + 1 >= floor then
 			Auto.lastDown = now
-			setAutoLevel(Active.level - 1, now)
+			setAutoPreset(Active.presetIdx + 1, now)
 		end
 	end
 end
 
 --==================================================================================================
--- 10) USER INTERFACE
+-- 10) BENCHMARK + SCREENSHOT MODE
+--==================================================================================================
+runBenchmark = function()
+	if Bench.running then return end
+	Bench = { running = true, startTime = os.clock(), samples = {}, avg = 0, min = math.huge, max = 0,
+	          minFps = math.huge, maxFps = 0, result = nil }
+	task.spawn(function()
+		notify("FPS BOOSTER", "Benchmark started (10s)…", 3)
+		local frames, acc, maxFps, minFps = 0, 0, 0, math.huge
+		local conn = RunService.RenderStepped:Connect(function(dt)
+			frames += 1
+			acc += dt
+			if dt > 0 then
+				local fps = 1 / dt
+				if fps > maxFps then maxFps = fps end
+				if fps < minFps then minFps = fps end
+			end
+		end)
+		local elapsed = 0
+		while elapsed < CONFIG.BENCHMARK_DURATION do
+			task.wait(0.5)
+			elapsed = os.clock() - Bench.startTime
+			Bench.avg = (acc > 0) and (frames / acc) or 0
+		end
+		conn:Disconnect()
+		Bench.running = false
+		Bench.avg = (acc > 0) and (frames / acc) or 0
+		Bench.minFps, Bench.maxFps = minFps, maxFps
+		-- Suggest preset based on avg FPS
+		local sugIdx
+		if Bench.avg >= 100 then sugIdx = 5
+		elseif Bench.avg >= 60 then sugIdx = 4
+		elseif Bench.avg >= 45 then sugIdx = 3
+		elseif Bench.avg >= 30 then sugIdx = 2
+		else sugIdx = 1 end
+		Bench.result = sugIdx
+		notify("FPS BOOSTER", string.format("Benchmark: avg %.0f FPS · recommend %s %s",
+			Bench.avg, PRESETS[sugIdx].icon, PRESETS[sugIdx].name), 8)
+	end)
+end
+
+toggleScreenshotMode = function()
+	if State.screenshotMode then return end
+	State.screenshotMode = true
+	reapplyAll()
+	if UI then UI.syncControls(false) end
+	notify("FPS BOOSTER", "Screenshot mode — original visuals restored", 2)
+	task.delay(CONFIG.SCREENSHOT_PAUSE, function()
+		State.screenshotMode = false
+		reapplyAll()
+		if UI then UI.syncControls(false) end
+		notify("FPS BOOSTER", "Screenshot mode ended", 2)
+	end)
+end
+
+--==================================================================================================
+-- 11) USER INTERFACE
 --==================================================================================================
 local function buildUI()
 	local gui = make("ScreenGui", {
@@ -1138,7 +1166,7 @@ local function buildUI()
 	local cam = workspace.CurrentCamera
 	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
 	local TITLE_H = 42
-	local width = math.clamp(vp.X - 24, 260, 320)
+	local width = math.clamp(vp.X - 24, 280, 340)
 
 	local window = make("Frame", {
 		Name = "Window", Size = UDim2.fromOffset(width, TITLE_H), Position = UDim2.fromOffset(12, 80),
@@ -1154,7 +1182,7 @@ local function buildUI()
 		BackgroundColor3 = C.green, BorderSizePixel = 0 }, titleBar)
 	make("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
 	local titleText = make("TextLabel", {
-		BackgroundTransparency = 1, Text = "FPS BOOSTER V2", Font = Enum.Font.GothamBlack, TextSize = 14,
+		BackgroundTransparency = 1, Text = "FPS BOOSTER V3", Font = Enum.Font.GothamBlack, TextSize = 14,
 		TextColor3 = C.green, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
 		Position = UDim2.fromOffset(32, 0), Size = UDim2.new(1, -112, 1, 0),
 	}, titleBar)
@@ -1180,9 +1208,9 @@ local function buildUI()
 		PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, body)
 	local list = make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 
-	local function card(h, order, parent)
+	local function card(h, order)
 		local f = make("Frame", { Size = UDim2.new(1, 0, 0, h), BackgroundColor3 = C.panel,
-			BorderSizePixel = 0, LayoutOrder = order, ClipsDescendants = true }, parent or body)
+			BorderSizePixel = 0, LayoutOrder = order, ClipsDescendants = true }, body)
 		make("UICorner", { CornerRadius = UDim.new(0, 8) }, f)
 		return f
 	end
@@ -1198,6 +1226,7 @@ local function buildUI()
 			Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -20, 0, 12) })
 	end
 
+	-- Stats row
 	local statsRow = make("Frame", { Size = UDim2.new(1, 0, 0, 68), BackgroundTransparency = 1, LayoutOrder = 1 }, body)
 	make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8),
 		SortOrder = Enum.SortOrder.LayoutOrder }, statsRow)
@@ -1213,10 +1242,31 @@ local function buildUI()
 		return value, sub
 	end
 	local fpsValue, fpsSub = statCard(1, "FPS")
-	local pingValue, pingSub = statCard(2, "PING (MEASURED)")
+	local pingValue, pingSub = statCard(2, "PING")
 
-	-- Network card
-	local netCard = card(94, 2)
+	-- ===== GRAPHICS PRESETS =====
+	local presetCard = card(320, 2)
+	caption(presetCard, "GRAPHICS PRESET")
+	local presetBtns = {}
+	for i, p in ipairs(PRESETS) do
+		local y = 22 + (i - 1) * 58
+		local btn = make("TextButton", {
+			Text = "", BackgroundColor3 = C.chip, AutoButtonColor = false, BorderSizePixel = 0,
+			Position = UDim2.fromOffset(10, y), Size = UDim2.new(1, -20, 0, 54),
+		}, presetCard)
+		make("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
+		local iconLbl = label(btn, { Text = p.icon, TextSize = 24, Font = Enum.Font.GothamBlack,
+			Position = UDim2.fromOffset(8, 12), Size = UDim2.fromOffset(40, 30) })
+		local nameLbl = label(btn, { Text = string.format("%d. %s", i, p.name), Font = Enum.Font.GothamBold,
+			TextSize = 13, Position = UDim2.fromOffset(52, 8), Size = UDim2.new(1, -62, 0, 18) })
+		local descLbl = label(btn, { Text = p.desc, TextSize = 10, TextColor3 = C.dim,
+			Position = UDim2.fromOffset(52, 26), Size = UDim2.new(1, -62, 0, 20) })
+		btn.Activated:Connect(function() setPreset(i) end)
+		presetBtns[i] = btn
+	end
+
+	-- Network
+	local netCard = card(94, 3)
 	local netLine1 = label(netCard, { Text = "Network: …", Font = Enum.Font.GothamBold, TextSize = 13,
 		Position = UDim2.fromOffset(10, 8), Size = UDim2.new(1, -20, 0, 16) })
 	local netLine2 = label(netCard, { Text = "", TextSize = 11, TextColor3 = C.dim, TextWrapped = true,
@@ -1224,8 +1274,9 @@ local function buildUI()
 	local netAdvice = label(netCard, { Text = "", TextSize = 10, TextColor3 = C.yellow, TextWrapped = true,
 		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 68), Size = UDim2.new(1, -20, 0, 22) })
 
-	local ROWS = { "Booster", "Mode", "Profile", "VFX level", "Workload", "Device", "Status" }
-	local dash = card(14 + #ROWS * 22, 3)
+	-- Dashboard
+	local ROWS = { "Booster", "Mode", "Profile", "Preset", "Workload", "Device", "Status" }
+	local dash = card(14 + #ROWS * 22, 4)
 	local rowDots, rowTexts = {}, {}
 	for i, name in ipairs(ROWS) do
 		local y = 7 + (i - 1) * 22
@@ -1238,11 +1289,13 @@ local function buildUI()
 		rowDots[name] = d
 	end
 
-	local whyCard = card(122, 4)
+	-- Why
+	local whyCard = card(122, 5)
 	caption(whyCard, "WHY THIS PROFILE")
 	local whyText = label(whyCard, { Text = "", TextSize = 11, TextColor3 = C.text, TextWrapped = true,
 		TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(10, 22), Size = UDim2.new(1, -20, 0, 96) })
 
+	-- Toggle
 	local function makeToggle(order, text, sub, initial, onChange)
 		local row = card(sub and 50 or 40, order)
 		label(row, { Text = text, Font = Enum.Font.GothamBold, TextSize = 13,
@@ -1271,43 +1324,16 @@ local function buildUI()
 		hit.Activated:Connect(function() onChange(not value) end)
 		return set
 	end
-	local setBoosterToggle = makeToggle(5, "Booster", nil, State.enabled, function(v) setEnabled(v) end)
-	local setAutoToggle = makeToggle(6, "Auto Settings", "Detect game + adapt level", true, function(v)
-		if v then setMode("Auto") else setMode("Custom") end
+	local setBoosterToggle = makeToggle(6, "Booster", "Master on/off", State.enabled, function(v) setEnabled(v) end)
+	local setAutoToggle = makeToggle(7, "Auto Mode", "Adapt preset to FPS", State.mode == "Auto", function(v)
+		if v then setMode("Auto") else setMode("Manual") end
 	end)
+	local setAutoQualityToggle = makeToggle(8, "Auto Quality", "Drop preset if FPS < 25", State.autoQuality,
+		function(v) setAutoQuality(v) end)
 
-	local function makeChips(order, cap, names, onPick)
-		local f = card(60, order)
-		caption(f, cap)
-		local row = make("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 24),
-			Size = UDim2.new(1, -20, 0, 30) }, f)
-		make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4),
-			SortOrder = Enum.SortOrder.LayoutOrder }, row)
-		local n = #names
-		local btns = {}
-		for i, name in ipairs(names) do
-			local b = make("TextButton", {
-				Text = name, Font = Enum.Font.GothamBold, TextSize = (n >= 5) and 10 or 11, TextColor3 = C.dim,
-				BackgroundColor3 = C.chip, AutoButtonColor = false, BorderSizePixel = 0, LayoutOrder = i,
-				Size = UDim2.new(1 / n, -4 * (n - 1) / n, 1, 0),
-			}, row)
-			make("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
-			b.Activated:Connect(function() onPick(i) end)
-			btns[i] = b
-		end
-		return function(active, color, instant)
-			for i, b in ipairs(btns) do
-				local on = (i == active)
-				local bg, fg = on and color or C.chip, on and C.dark or C.dim
-				if instant then b.BackgroundColor3, b.TextColor3 = bg, fg
-				else tween(b, 0.18, { BackgroundColor3 = bg, TextColor3 = fg }) end
-			end
-		end
-	end
-	local setModeChips = makeChips(7, "MODE", { "Auto", "Ultra", "Balance", "Visual", "Custom" }, function(i) setMode(MODES[i]) end)
-
-	local profCard = card(62, 8)
-	caption(profCard, "GAME PROFILE (manual pick = Custom mode)")
+	-- Profile selector
+	local profCard = card(62, 9)
+	caption(profCard, "GAME PROFILE")
 	local function arrow(text, xScale, xOff)
 		local b = make("TextButton", { Text = text, Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = C.text,
 			BackgroundColor3 = C.chip, AutoButtonColor = true, BorderSizePixel = 0,
@@ -1323,15 +1349,37 @@ local function buildUI()
 	prevBtn.Activated:Connect(function() cycleProfile(-1) end)
 	nextBtn.Activated:Connect(function() cycleProfile(1) end)
 
-	local setLevelChips = makeChips(9, "VFX REDUCTION LEVEL", { "Low", "Medium", "High", "Ultra" }, function(i) setCustomLevel(i) end)
-
-	local setIFrameToggle = makeToggle(10, "IFrame overlays", "Hides only explicitly tagged visual overlays", false,
+	-- IFrame toggle
+	local setIFrameToggle = makeToggle(10, "IFrame overlays", "Hide tagged visual overlays", false,
 		function(v) setIFrame(v) end)
 
+	-- Actions
+	local actionRow = make("Frame", { Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1, LayoutOrder = 11 }, body)
+	make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder }, actionRow)
+	local function actionBtn(order, text, color, onActivate)
+		local b = make("TextButton", {
+			Text = text, Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = color,
+			BackgroundColor3 = C.panel, AutoButtonColor = false, BorderSizePixel = 0,
+			Size = UDim2.new(0.5, -3, 1, 0), LayoutOrder = order,
+		}, actionRow)
+		make("UICorner", { CornerRadius = UDim.new(0, 8) }, b)
+		make("UIStroke", { Color = color, Thickness = 1, Transparency = 0.3 }, b)
+		b.Activated:Connect(function()
+			b.BackgroundColor3 = color
+			tween(b, 0.3, { BackgroundColor3 = C.panel })
+			onActivate()
+		end)
+		return b
+	end
+	actionBtn(1, "📸 SCREENSHOT", C.purple, function() toggleScreenshotMode() end)
+	actionBtn(2, "⏱ BENCHMARK", C.yellow, function() runBenchmark() end)
+
+	-- Restore
 	local restoreBtn = make("TextButton", {
-		Text = "RESTORE ORIGINAL SETTINGS", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.blue,
+		Text = "RESTORE ORIGINALS", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.blue,
 		BackgroundColor3 = C.panel, AutoButtonColor = false, BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 0, 42), LayoutOrder = 11,
+		Size = UDim2.new(1, 0, 0, 42), LayoutOrder = 12,
 	}, body)
 	make("UICorner", { CornerRadius = UDim.new(0, 8) }, restoreBtn)
 	make("UIStroke", { Color = C.blue, Thickness = 1.2, Transparency = 0.2 }, restoreBtn)
@@ -1341,10 +1389,11 @@ local function buildUI()
 		restoreAll()
 	end)
 
-	label(body, { Text = "Render distance, fog & streaming are never modified. Ping is measured, not faked. Physical network latency cannot be changed by a LocalScript; this tool reduces perceived lag & server load.",
+	label(body, { Text = "Hotkeys: F1=toggle · F2=screenshot · F3=cycle preset · F4=benchmark",
 		TextSize = 10, TextColor3 = C.dim, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
-		Size = UDim2.new(1, 0, 0, 52), LayoutOrder = 12 })
+		Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 13 })
 
+	-- Minimize / resize
 	local minimized = false
 	local function fullHeight()
 		local maxBody = math.max(120, gui.AbsoluteSize.Y - 110)
@@ -1396,14 +1445,32 @@ local function buildUI()
 		end
 	end))
 
+	-- Public API
 	local api = { gui = gui }
 
 	function api.syncControls(instant)
 		setBoosterToggle(State.enabled, instant)
 		setAutoToggle(State.mode == "Auto", instant)
+		setAutoQualityToggle(State.autoQuality, instant)
 		setIFrameToggle(IFrame.enabled, instant)
-		setModeChips(table.find(MODES, State.mode), C.green, instant)
-		setLevelChips(Active.level, (State.mode == "Auto") and C.blue or C.green, instant)
+		for i, btn in ipairs(presetBtns) do
+			local active = (i == Active.presetIdx)
+			local p = PRESETS[i]
+			local bg = active and p.color or C.chip
+			local fg = active and C.dark or C.text
+			if instant then
+				btn.BackgroundColor3 = bg
+			else
+				tween(btn, 0.18, { BackgroundColor3 = bg })
+			end
+			for _, child in ipairs(btn:GetChildren()) do
+				if child:IsA("TextLabel") and child ~= btn then
+					if child.Font == Enum.Font.GothamBold then
+						child.TextColor3 = fg
+					end
+				end
+			end
+		end
 	end
 
 	local function setRow(name, text, color)
@@ -1414,19 +1481,18 @@ local function buildUI()
 	function api.update()
 		local fpsInt = math.floor(Perf.fps + 0.5)
 		if minimized then
-			setText(titleText, (Perf.fps > 0 and ("V2 · " .. fpsInt .. " FPS") or "V2")
+			setText(titleText, (Perf.fps > 0 and ("V3 · " .. fpsInt .. " FPS") or "V3")
 				.. (Net.ping and (" · " .. math.floor((smoothPing() or Net.ping) + 0.5) .. " ms") or ""))
 			return
 		end
-		setText(titleText, "FPS BOOSTER V2")
+		setText(titleText, "FPS BOOSTER V3")
 
 		local ratio = (Perf.fps > 0) and (Perf.fps / targetFps()) or 1
 		local fpsColor = (ratio >= 0.93) and C.green or ((ratio >= 0.6) and C.yellow or C.red)
 		setText(fpsValue, (Perf.fps > 0) and tostring(fpsInt) or "--")
 		fpsValue.TextColor3 = (Perf.fps > 0) and fpsColor or C.dim
 		setText(fpsSub, (Perf.fps > 0)
-			and string.format("%.1f ms · worst %d ms · %d hitches", Perf.frameMs, math.floor(Perf.worstMs + 0.5), Perf.hitchShown)
-			or "measuring…")
+			and string.format("%.1f ms · %d hitches", Perf.frameMs, Perf.hitchShown) or "measuring…")
 
 		local smoothed = smoothPing()
 		if smoothed then
@@ -1439,46 +1505,46 @@ local function buildUI()
 
 		local nColor = ({ Excellent = C.green, Good = C.green, Fair = C.yellow, Poor = C.red,
 			Unstable = C.red, Unavailable = C.dim })[Net.status] or C.dim
-		setText(netLine1, "Connection: " .. (Net.ping and "Connected" or "Unknown")
-			.. " · " .. Net.status .. " · " .. NetOpt.region)
+		setText(netLine1, "Connection · " .. Net.status .. " · " .. NetOpt.region)
 		netLine1.TextColor3 = nColor
-
 		if Net.ping then
-			local extra = ""
-			if Net.recv and Net.send then
-				extra = string.format(" · ↓%d ↑%d kbps", math.floor(Net.recv), math.floor(Net.send))
-			end
-			setText(netLine2, string.format(
-				"RTT %d ms · jitter %d · peak %d\nPerceived %.0f ms (%s) · %s%s",
+			setText(netLine2, string.format("RTT %d · jitter %d · peak %d\nPerceived %.0f ms (%s)",
 				math.floor(NetDiag.serverRTT + 0.5), math.floor(Net.jitter + 0.5),
-				math.floor(Net.peak + 0.5), NetDiag.perceived, NetDiag.netHealth, Net.trend, extra))
+				math.floor(Net.peak + 0.5), NetDiag.perceived, NetDiag.netHealth))
 		else
 			setText(netLine2, "Ping unavailable on this client.")
 		end
 		setText(netAdvice, NetDiag.advice)
 
-		if State.enabled then setRow("Booster", "Enabled", C.green) else setRow("Booster", "Off · originals restored", C.off) end
+		if not ready then setRow("Booster", StatusText, C.yellow)
+		elseif not State.enabled then setRow("Booster", "Off · restored", C.off)
+		elseif State.screenshotMode then setRow("Booster", "Screenshot mode", C.purple)
+		else setRow("Booster", "Enabled", C.green) end
 		setRow("Mode", MODE_NAMES[State.mode], (State.mode == "Auto") and C.blue or C.green)
 		local prof = PROFILES[Active.profile]
-		local manual = (State.mode == "Custom" and State.profileChoice ~= "Auto")
-		local sigTxt = (MapInfo.signature ~= "Unknown")
-			and string.format(" [%s %d%%]", MapInfo.signature, MapInfo.confidence) or ""
-		setRow("Profile", prof.tag .. " · " .. prof.display .. sigTxt .. (manual and " (manual)" or ""), C.green)
-		setRow("VFX level", LEVELS[Active.level].name .. ((State.mode == "Auto") and " · adaptive" or ""),
-			State.enabled and C.green or C.off)
+		local manual = (State.profileChoice ~= "Auto")
+		setRow("Profile", prof.tag .. " · " .. prof.display .. (manual and " (manual)" or ""), C.green)
+		local preset = PRESETS[Active.presetIdx]
+		setRow("Preset", preset.icon .. " " .. preset.name, preset.color)
 		local wl = Detect.workload
-		setRow("Workload", string.format("%s · %d active FX", wl, Metrics.active + Metrics.trails + Metrics.beams),
+		setRow("Workload", string.format("%s · %d FX", wl, Metrics.active + Metrics.trails + Metrics.beams),
 			(wl == "Light" or wl == "Unknown") and C.green or ((wl == "Moderate") and C.yellow or C.red))
 		local pl, pc = perfLabel()
-		setRow("Device", platformName .. " · " .. pl .. (Perf.memMb and (" · " .. math.floor(Perf.memMb) .. " MB") or ""), pc)
-		if not ready then setRow("Status", StatusText, C.yellow)
+		setRow("Device", platformName .. " · " .. pl .. (Perf.memMb and (" · " .. math.floor(Perf.memMb) .. "MB") or ""), pc)
+		if Bench.running then setRow("Status", string.format("Benchmarking… %.0f FPS", Bench.avg), C.yellow)
+		elseif not ready then setRow("Status", StatusText, C.yellow)
 		elseif not State.enabled then setRow("Status", "Restored", C.blue)
-		else setRow("Status", string.format("Optimized · %d/%d FX adjusted", Counts.adjusted, Counts.tracked), C.green) end
+		else setRow("Status", string.format("%d/%d FX adjusted", Counts.adjusted, Counts.tracked), C.green) end
 
-		local whyLine = manual and "Profile chosen manually; detection continues in the background." or Detect.reason
+		local whyLine = manual and "Profile chosen manually." or Detect.reason
 		local mapLine = "Map: " .. (MapInfo.placeName ~= "" and MapInfo.placeName or ("PlaceId " .. MapInfo.placeId))
 			.. string.format(" · %d players · %d parts", MapInfo.playerCount, MapInfo.partCount)
-		setText(whyText, whyLine .. "\n" .. mapLine .. "\nBottleneck: " .. Auto.bottleneck)
+		local benchLine = ""
+		if Bench.result then
+			local bs = PRESETS[Bench.result]
+			benchLine = string.format("\nBenchmark: %.0f FPS avg → %s %s", Bench.avg, bs.icon, bs.name)
+		end
+		setText(whyText, whyLine .. "\n" .. mapLine .. benchLine .. "\n" .. Auto.bottleneck)
 
 		local choice = State.profileChoice
 		setText(profLabel, (choice == "Auto") and ("Auto → " .. PROFILES[Detect.profile].tag .. " · " .. PROFILES[Detect.profile].display)
@@ -1494,7 +1560,7 @@ local function buildUI()
 end
 
 --==================================================================================================
--- 11) CONTROLS
+-- 12) CONTROLS
 --==================================================================================================
 setEnabled = function(v)
 	State.enabled = v and true or false
@@ -1504,32 +1570,38 @@ end
 
 setMode = function(m)
 	if State.mode == m then return end
-	if m == "Custom" then State.customLevel = Active.level end
 	if m == "Auto" then
-		Auto.level = baselineLevel(Detect.profile)
+		Auto.presetIdx = suggestPreset(Detect.profile)
 		Auto.low, Auto.high, Auto.pending = 0, 0, nil
 		Auto.floorUntil, Auto.noRaiseUntil, Auto.lastChange = 0, 0, os.clock()
-		State.profileChoice = "Auto"
 	end
 	State.mode = m
 	refresh()
+end
+
+setPreset = function(idx)
+	if idx < 1 or idx > #PRESETS then return end
+	State.presetId = PRESETS[idx].id
+	State.mode = "Manual"
+	refresh()
+end
+
+cyclePreset = function()
+	local cur = Active.presetIdx
+	local next_ = (cur % #PRESETS) + 1
+	setPreset(next_)
 end
 
 cycleProfile = function(dir)
 	local idx = table.find(PROFILE_CHOICES, State.profileChoice) or 1
 	idx = ((idx - 1 + dir) % #PROFILE_CHOICES) + 1
 	State.profileChoice = PROFILE_CHOICES[idx]
-	if State.mode ~= "Custom" then
-		State.customLevel = Active.level
-		State.mode = "Custom"
-	end
 	refresh()
 end
 
-setCustomLevel = function(i)
-	State.customLevel = i
-	State.mode = "Custom"
-	refresh()
+setAutoQuality = function(v)
+	State.autoQuality = v and true or false
+	if UI then UI.syncControls(false) end
 end
 
 restoreAll = function()
@@ -1539,7 +1611,7 @@ restoreAll = function()
 end
 
 --==================================================================================================
--- 12) SHUTDOWN + INITIALIZATION
+-- 13) SHUTDOWN + INIT
 --==================================================================================================
 local function destroy()
 	if not running then return end
@@ -1551,17 +1623,33 @@ local function destroy()
 	table.clear(IFrame.conns)
 
 	State.enabled = false
+	State.screenshotMode = false
 	local all = {}
 	for inst in pairs(records) do all[#all + 1] = inst end
 	for _, inst in ipairs(all) do pcall(processAny, inst) end
 
 	pcall(restoreNetworkOpt)
-
 	if UI and UI.gui then UI.gui:Destroy() end
 	if _G.__FPSBooster and _G.__FPSBooster.Destroy == destroy then _G.__FPSBooster = nil end
 end
 closeAll = destroy
 _G.__FPSBooster = { Destroy = destroy }
+
+local function setupHotkeys()
+	if not CONFIG.HOTKEYS_ENABLED then return end
+	track(UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
+		if input.KeyCode == Enum.KeyCode.F1 then
+			setEnabled(not State.enabled)
+		elseif input.KeyCode == Enum.KeyCode.F2 then
+			toggleScreenshotMode()
+		elseif input.KeyCode == Enum.KeyCode.F3 then
+			cyclePreset()
+		elseif input.KeyCode == Enum.KeyCode.F4 then
+			runBenchmark()
+		end
+	end))
+end
 
 local function startMonitor()
 	task.spawn(function()
@@ -1594,7 +1682,6 @@ local function startMonitor()
 				Perf.hitchShown, Perf.hitches = Perf.hitches, 0
 				pcall(function() Perf.memMb = Stats:GetTotalMemoryUsageMb() end)
 			end
-			-- Staggered background tasks (anti-stutter)
 			if tick % CONFIG.MAP_SCAN_INTERVAL == 0 then
 				task.spawn(function() pcall(scanMapInfo) end)
 			end
@@ -1616,14 +1703,13 @@ local function init()
 	track(RunService.Heartbeat:Connect(function()
 		if not ready or #pending == 0 then return end
 		local n = 0
-		while #pending > 0 and n < 40 do
+		while #pending > 0 and n < 50 do
 			local inst = table.remove(pending)
 			pcall(function() register(inst); processInstance(inst) end)
 			n += 1
 		end
 	end))
 
-	-- Fast FPS tracking with local vars (no hash lookup per frame)
 	local _frames, _acc, _maxDt, _hitches = 0, 0, 0, 0
 	track(RunService.RenderStepped:Connect(function(dt)
 		_frames += 1
@@ -1633,26 +1719,21 @@ local function init()
 		Perf.frames, Perf.acc, Perf.maxDt, Perf.hitches = _frames, _acc, _maxDt, _hitches
 	end))
 
+	setupHotkeys()
 	UI = buildUI()
-
-	-- Network optimization first (safe, fast)
 	pcall(applyNetworkOpt)
 
-	-- Analyze experience (registers effects, gathers scene stats)
 	scanRoot(Lighting)
 	scanRoot(workspace)
 	finishScene()
 	updateMetrics()
 	updateCounts()
 
-	-- Map scan in background so UI shows up immediately
 	task.spawn(function()
 		RunService.Heartbeat:Wait()
 		RunService.Heartbeat:Wait()
 		pcall(scanMapInfo)
 	end)
-
-	-- Wait for the map scan (short)
 	local waited = 0
 	while MapInfo.detectedAt == 0 and waited < 30 do
 		task.wait(0.1)
@@ -1660,7 +1741,8 @@ local function init()
 	end
 
 	runDetection(true, os.clock())
-	Active.level, Active.profile = resolveActive()
+	Active.presetId, Active.presetIdx, Active.profile = resolveActive()
+	updateCur()
 
 	generation += 1
 	runPass(generation)
@@ -1674,13 +1756,13 @@ end
 local ok, err = pcall(init)
 if ok then
 	task.spawn(function()
-		notify("FPS BOOSTER V2", "Smart optimization applied — VFX + map + network ready!", 5)
-		notify("FPS BOOSTER V2", string.format("Profile: %s %s · VFX level: %s (%s)",
-			PROFILES[Active.profile].tag, PROFILES[Active.profile].display, LEVELS[Active.level].name,
-			MODE_NAMES[State.mode]), 6)
+		notify("FPS BOOSTER V3", "Ready! 5 graphics presets available.", 4)
+		notify("FPS BOOSTER V3", string.format("%s %s · Profile: %s",
+			PRESETS[Active.presetIdx].icon, PRESETS[Active.presetIdx].name,
+			PROFILES[Active.profile].display), 5)
 	end)
 else
-	warn("[FPSBoosterV2] Initialization failed: " .. tostring(err))
+	warn("[FPSBoosterV3] Init failed: " .. tostring(err))
 	pcall(destroy)
-	task.spawn(notify, "FPS BOOSTER V2", "Initialization failed: " .. string.sub(tostring(err), 1, 120), 8)
+	task.spawn(notify, "FPS BOOSTER V3", "Init failed: " .. string.sub(tostring(err), 1, 120), 8)
 end
